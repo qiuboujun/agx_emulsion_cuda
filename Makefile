@@ -36,8 +36,14 @@ OBJECTS     := $(OBJECTS_CU) $(OBJECTS_CPP)
 DEPS        := $(OBJECTS:.o=.d)
 
 # ---------------------- rules ----------------------
-.PHONY: all clean
+.PHONY: all clean tests
 all: $(TARGET)
+
+TEST_EXE := tests/norm_test
+
+tests: tests/gen_norm_reference.py $(TEST_EXE)
+	python3 tests/gen_norm_reference.py
+	./$(TEST_EXE)
 
 $(TARGET): $(OBJECTS)
 	$(CXX) $^ -o $@ $(LDFLAGS)
@@ -56,5 +62,5 @@ $(TARGET): $(OBJECTS)
 -include $(DEPS)
 
 clean:
-	rm -f $(TARGET) $(OBJECTS) $(DEPS)
+	rm -f $(TARGET) $(OBJECTS) $(DEPS) $(TEST_EXE)
 

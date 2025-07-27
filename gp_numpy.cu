@@ -189,6 +189,26 @@ void sinc_inplace(dvec& a){
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
+// ---------------- Standard normal PDF / CDF ----------------
+namespace {
+const double INV_SQRT_2PI = 0.39894228040143267794;   // 1/sqrt(2π)
+const double INV_SQRT2    = 0.70710678118654752440;    // 1/√2
+}
+
+void norm_pdf(const dvec& x, dvec& out){
+    out.resize(x.size());
+    thrust::transform(x.begin(), x.end(), out.begin(), [] __device__ (double v){
+        return INV_SQRT_2PI * exp(-0.5 * v * v);
+    });
+}
+
+void norm_cdf(const dvec& x, dvec& out){
+    out.resize(x.size());
+    thrust::transform(x.begin(), x.end(), out.begin(), [] __device__ (double v){
+        return 0.5 * (1.0 + erf(v * INV_SQRT2));
+    });
+}
+
 // --------------- Integrals ---------------
 double trapz(const dvec& y, double dx){
     double total = sum(y);

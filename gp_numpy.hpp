@@ -59,6 +59,12 @@ void power_inplace(dvec& a, double p);
 void clip_inplace(dvec& a, double lo, double hi);
 void sinc_inplace(dvec& a);
 
+// --- New: Standard normal distribution helpers ---
+// Compute y = ϕ(x) where ϕ is the standard normal PDF.
+void norm_pdf(const dvec& x, dvec& out);
+// Compute y = Φ(x) where Φ is the standard normal CDF.
+void norm_cdf(const dvec& x, dvec& out);
+
 // Reductions / stats
 bool   any(const dvec& a);
 double sum(const dvec& a);
