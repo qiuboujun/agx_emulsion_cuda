@@ -37,9 +37,19 @@ __global__ void interp_linear_kernel(const double* __restrict__ x,
     if (i >= m) return;
 
     double xv = xq[i];
-    // Clamp outside
-    if (xv <= x[0])      { yq[i] = y[0];      return; }
-    if (xv >= x[n-1])    { yq[i] = y[n-1];    return; }
+    // Linear extrapolation outside the input range (to match SciPy
+    // `fill_value="extrapolate"`). Use the slope of the first / last
+    // segment.
+    if (xv <= x[0]) {
+        double slope = (y[1] - y[0]) / (x[1] - x[0]);
+        yq[i] = y[0] + slope * (xv - x[0]);
+        return;
+    }
+    if (xv >= x[n-1]) {
+        double slope = (y[n-1] - y[n-2]) / (x[n-1] - x[n-2]);
+        yq[i] = y[n-1] + slope * (xv - x[n-1]);
+        return;
+    }
 
     // Binary search
     int lo = 0, hi = n - 1;
@@ -142,7 +152,8 @@ static void solve_banded_system(const hvec& h, hvec& b, hvec& c) {
 
 static CubicSpline build_scipy_spline(const hvec& x, const hvec& y)
 {
-    int n = x.size();                 // n ≥ 2
+    // Natural cubic spline (second derivative = 0 at endpoints).
+    int n = x.size();
     CubicSpline sp;
     sp.x = x;
     sp.a.resize(n - 1);
@@ -150,63 +161,35 @@ static CubicSpline build_scipy_spline(const hvec& x, const hvec& y)
     sp.c.resize(n);
     sp.d.resize(n - 1);
 
-    /* --- spacing ------------------------------------------------------ */
+    if(n < 2){
+        std::fill(sp.c.begin(), sp.c.end(), 0.0);
+        return sp;
+    }
+
     hvec h(n - 1);
     for (int i = 0; i < n - 1; ++i)
         h[i] = x[i + 1] - x[i];
 
-    /* --- build tridiagonal for not‑a‑knot ----------------------------- *
-     *   FITPACK sets:
-     *       h0 * c0 + (h0 + h1) * c1 + h1 * c2 = 3 * ((y2 - y1)/h1 - (y1 - y0)/h0)
-     *       hi * ci   + 2 (hi + hi+1) * ci+1 + hi+1 * ci+2 = 3 *(...) for i=1..n-3
-     *       hn-2 * cn-3 + (hn-3 + hn-2) * cn-2 + hn-3 * cn-1 = 3 *(...)
-     *   Then c0 = c1 and cn-1 = cn-2
-     * ------------------------------------------------------------------ */
-    int m = n - 2;                    // unknowns: c1 .. c_{n-2}
-    if (m <= 0) {                     // linear data
-        std::fill(sp.c.begin(), sp.c.end(), 0.0);
-    } else {
-        hvec lower(m-1), diag(m), upper(m-1), rhs(m);
+    hvec alpha(n);
+    alpha[0] = 0.0;
+    alpha[n-1] = 0.0;
+    for (int i = 1; i < n - 1; ++i)
+        alpha[i] = 3 * ( (y[i+1]-y[i]) / h[i] - (y[i]-y[i-1]) / h[i-1] );
 
-        /* first row (i = 0 corresponds to original index 1) */
-        diag[0]  = h[0] + h[1];
-        upper[0] = h[1];
-        rhs[0]   = 3 * ((y[2]-y[1])/h[1] - (y[1]-y[0])/h[0]);
-
-        /* inner rows */
-        for (int i = 1; i < m-1; ++i) {
-            lower[i-1] = h[i];
-            diag[i]    = 2 * (h[i] + h[i+1]);
-            upper[i]   = h[i+1];
-            rhs[i]     = 3 * ((y[i+2]-y[i+1])/h[i+1] - (y[i+1]-y[i])/h[i]);
-        }
-
-        /* last row (index m-1 -> original n-2) */
-        lower[m-2] = h[n-3];
-        diag[m-1]  = h[n-3] + h[n-2];
-        rhs[m-1]   = 3 * ((y[n-1]-y[n-2])/h[n-2] - (y[n-2]-y[n-3])/h[n-3]);
-
-        /* solve tridiagonal (Thomas) */
-        for (int i = 1; i < m; ++i) {
-            double w = lower[i-1] / diag[i-1];
-            diag[i] -= w * upper[i-1];
-            rhs[i]  -= w * rhs[i-1];
-        }
-        sp.c[n-2] = rhs[m-1] / diag[m-1];
-        for (int i = m-2; i >= 0; --i)
-            sp.c[i+1] = (rhs[i] - upper[i] * sp.c[i+2]) / diag[i];
-
-        /* not‑a‑knot constraints */
-        sp.c[0]   = sp.c[1];
-        sp.c[n-1] = sp.c[n-2];
+    hvec l(n), mu(n), z(n);
+    l[0] = 1.0; mu[0] = z[0] = 0.0;
+    for (int i = 1; i < n - 1; ++i){
+        l[i] = 2*(x[i+1] - x[i-1]) - h[i-1]*mu[i-1];
+        mu[i] = h[i]/l[i];
+        z[i]  = (alpha[i] - h[i-1]*z[i-1]) / l[i];
     }
+    l[n-1] = 1.0; z[n-1] = 0.0; sp.c[n-1] = 0.0;
 
-    /* --- back‑substitute for a,b,d ------------------------------------ */
-    for (int i = 0; i < n - 1; ++i) {
-        sp.a[i] = y[i];
-        sp.b[i] = (y[i+1] - y[i]) / h[i]
-                - h[i] * (2*sp.c[i] + sp.c[i+1]) / 3.0;
-        sp.d[i] = (sp.c[i+1] - sp.c[i]) / (3.0 * h[i]);
+    for (int j = n - 2; j >= 0; --j){
+        sp.c[j] = z[j] - mu[j]*sp.c[j+1];
+        sp.b[j] = (y[j+1]-y[j])/h[j] - h[j]*(sp.c[j+1] + 2*sp.c[j])/3.0;
+        sp.d[j] = (sp.c[j+1] - sp.c[j]) / (3.0*h[j]);
+        sp.a[j] = y[j];
     }
     return sp;
 }
