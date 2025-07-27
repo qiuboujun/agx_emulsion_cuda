@@ -1,6 +1,11 @@
 # ---------------------- paths ----------------------
+<<<<<<< HEAD
 CUDA_PATH  ?= /slm/home/jqiu/Library/cuda
 EIGEN_PATH ?= /usr/local/include/eigen3
+=======
+CUDA_PATH  ?= /usr/local/cuda
+EIGEN_PATH ?= /usr/include/eigen3
+>>>>>>> fbf8680 (initial commit for Cursor agent contextcd)
 UTILS_DIR  := utils
 
 CXX  := g++
