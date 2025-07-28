@@ -45,6 +45,32 @@ def export_cie_data():
     d50_spd = standard_illuminant('D50')
     print(f"D50 SPD shape: {d50_spd.shape}")
     
+    # Get D65 illuminant SPD
+    d65_spd = standard_illuminant('D65')
+    print(f"D65 SPD shape: {d65_spd.shape}")
+    
+    # K75P - approximated as 7500K blackbody (common projection standard)
+    k75p_spd = colour.sd_blackbody(7500, SPECTRAL_SHAPE).values
+    print(f"K75P (7500K) SPD shape: {k75p_spd.shape}")
+    
+    # Bradford chromatic adaptation transform matrices
+    # From D50 to D65 and back
+    bradford_m = np.array([
+        [ 0.8951,  0.2664, -0.1614],
+        [-0.7502,  1.7135,  0.0367],
+        [ 0.0389, -0.0685,  1.0296]
+    ])
+    bradford_m_inv = np.array([
+        [ 0.9869929, -0.1470543,  0.1599627],
+        [ 0.4323053,  0.5183603,  0.0492912],
+        [-0.0085287,  0.0400428,  0.9684867]
+    ])
+    
+    # Pre-compute D65 cone responses for CAT
+    d65_white = np.array([0.95047, 1.0, 1.08883])  # D65 XYZ
+    d65_lms = bradford_m @ d65_white
+    print(f"D65 LMS cone responses: {d65_lms}")
+    
     # Export to header file
     output_dir = os.path.join(os.path.dirname(__file__), '..', 'AgXEmulsionOFX')
     
@@ -94,6 +120,54 @@ def export_cie_data():
                 f.write(",")
             if (i + 1) % 4 == 0:
                 f.write("\n")
+        f.write("\n};\n\n")
+        
+        f.write("// D65 Standard Illuminant SPD values\n")
+        f.write("__constant__ float c_d65SPD[CIE_SAMPLES] = {\n")
+        for i, val in enumerate(d65_spd):
+            f.write(f"    {val:.6f}f")
+            if i < len(d65_spd) - 1:
+                f.write(",")
+            if (i + 1) % 4 == 0:
+                f.write("\n")
+        f.write("\n};\n\n")
+        
+        f.write("// K75P (7500K) Standard Illuminant SPD values\n")
+        f.write("__constant__ float c_k75pSPD[CIE_SAMPLES] = {\n")
+        for i, val in enumerate(k75p_spd):
+            f.write(f"    {val:.6f}f")
+            if i < len(k75p_spd) - 1:
+                f.write(",")
+            if (i + 1) % 4 == 0:
+                f.write("\n")
+        f.write("\n};\n\n")
+        
+        f.write("// Bradford chromatic adaptation transform matrix\n")
+        f.write("__constant__ float c_bradfordM[9] = {\n")
+        for i, val in enumerate(bradford_m.flatten()):
+            f.write(f"    {val:.7f}f")
+            if i < 8:
+                f.write(",")
+            if (i + 1) % 3 == 0:
+                f.write("\n")
+        f.write("};\n\n")
+        
+        f.write("// Bradford inverse chromatic adaptation transform matrix\n")
+        f.write("__constant__ float c_bradfordMinv[9] = {\n")
+        for i, val in enumerate(bradford_m_inv.flatten()):
+            f.write(f"    {val:.7f}f")
+            if i < 8:
+                f.write(",")
+            if (i + 1) % 3 == 0:
+                f.write("\n")
+        f.write("};\n\n")
+        
+        f.write("// D65 cone responses (LMS) for Bradford CAT\n")
+        f.write("__constant__ float c_d65LMS[3] = {\n")
+        for i, val in enumerate(d65_lms):
+            f.write(f"    {val:.7f}f")
+            if i < 2:
+                f.write(",")
         f.write("\n};\n\n")
         
         f.write("// Wavelength values (for reference)\n")

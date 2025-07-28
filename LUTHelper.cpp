@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <vector>
 #include <string>
+#include <cstring>
 #include <dlfcn.h>
 #include <cstdio> // Required for printf
 
@@ -98,8 +99,57 @@ extern "C" bool loadFilmLUT(const char* stock, float* logE, float* r, float* g, 
     return true;
 } 
 
-extern "C" bool loadPrintLUT(const char* stock, float* logE, float* r, float* g, float* b) {
-    printf("DEBUG LUT PRINT: Searching for print stock '%s'\n", stock);
+static std::string parseViewingIlluminant(const std::string& stock) {
+    printf("DEBUG: parseViewingIlluminant for '%s'\n", stock.c_str());
+    
+    std::vector<std::string> roots;
+    roots.push_back("../data/profiles/");
+    roots.push_back("./data/profiles/");
+    roots.push_back("/usr/OFX/Plugins/data/profiles/");
+    
+    Dl_info info;
+    if(dladdr((void*)&loadPrintLUT,&info) && info.dli_fname){
+        std::string libPath(info.dli_fname);
+        size_t pos = libPath.find_last_of('/');
+        if(pos!=std::string::npos){
+            std::string dir = libPath.substr(0,pos+1);
+            roots.push_back(dir+"../../../data/profiles/");
+        }
+    }
+
+    for(const auto& root: roots){
+        std::string jsonPath = root + stock + ".json";
+        printf("DEBUG: Trying JSON path: %s\n", jsonPath.c_str());
+        
+        std::ifstream f(jsonPath);
+        if(!f.good()) continue;
+        
+        std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        
+        // Simple JSON parsing for "viewing_illuminant" field
+        size_t pos = content.find("\"viewing_illuminant\"");
+        if(pos != std::string::npos) {
+            size_t colon = content.find(":", pos);
+            if(colon != std::string::npos) {
+                size_t quote1 = content.find("\"", colon);
+                if(quote1 != std::string::npos) {
+                    size_t quote2 = content.find("\"", quote1 + 1);
+                    if(quote2 != std::string::npos) {
+                        std::string illuminant = content.substr(quote1 + 1, quote2 - quote1 - 1);
+                        printf("DEBUG: Found viewing illuminant: '%s'\n", illuminant.c_str());
+                        return illuminant;
+                    }
+                }
+            }
+        }
+    }
+    
+    printf("DEBUG: No viewing illuminant found, defaulting to D50\n");
+    return "D50";
+}
+
+extern "C" bool loadPrintLUT(const char* stock, float* logE, float* r, float* g, float* b, char* illuminant_out) {
+    printf("DEBUG LUT: Searching for print stock '%s'\n", stock);
     std::vector<std::string> roots;
     roots.push_back("../data/paper/");
     roots.push_back("./data/paper/");
@@ -142,34 +192,101 @@ extern "C" bool loadPrintLUT(const char* stock, float* logE, float* r, float* g,
     size_t n = std::min((size_t)601, x.size());
     for(size_t i=0;i<n;i++){logE[i]=x[i]; r[i]=yr[i]; g[i]=yg[i]; b[i]=yb[i];}
     for(size_t i=n;i<601;i++){logE[i]=r[i]=g[i]=b[i]=0.f;}
+    
+    // Parse viewing illuminant from profile JSON
+    std::string illuminant = parseViewingIlluminant(stock);
+    strncpy(illuminant_out, illuminant.c_str(), 15);
+    illuminant_out[15] = '\0';  // Ensure null termination
+    
     return true;
 } 
 
-extern "C" bool loadPaperSpectra(const char* stock,float* c,float* m,float* y,float* dmin,int* count){
-    printf("DEBUG SPECTRA: Loading paper spectra '%s'\n",stock);
-    std::vector<std::string> roots={"../data/paper/","./data/paper/","/usr/OFX/Plugins/data/paper/"};
-    Dl_info info; if(dladdr((void*)&loadPaperSpectra,&info)&&info.dli_fname){std::string libPath(info.dli_fname);size_t pos=libPath.find_last_of('/');if(pos!=std::string::npos){roots.push_back(libPath.substr(0,pos+1)+"../../../data/paper/");}}
+extern "C" bool loadPaperSpectra(const char* stock, float* c, float* m, float* y, float* dmin, int* count) {
+    printf("DEBUG: loadPaperSpectra for '%s'\n", stock);
+    
+    std::vector<std::string> roots;
+    roots.push_back("../data/paper/");
+    roots.push_back("./data/paper/");
+    roots.push_back("/usr/OFX/Plugins/data/paper/");
+    
+    Dl_info info;
+    if(dladdr((void*)&loadPaperSpectra,&info) && info.dli_fname){
+        std::string libPath(info.dli_fname);
+        size_t pos = libPath.find_last_of('/');
+        if(pos!=std::string::npos){
+            std::string dir = libPath.substr(0,pos+1);
+            roots.push_back(dir+"../../../data/paper/");
+        }
+    }
+
     std::string base="";
-    for(const auto& r:roots){std::string test=r+stock+"/";std::ifstream f(test+"dye_density_c.csv");if(f.good()){base=test;break;}}
+    for(const auto& root: roots){
+        std::string test = root + stock + "/";
+        std::ifstream f(test+"dye_density_c.csv");
+        if(f.good()){ 
+            base = test; 
+            break; 
+        }
+    }
     if(base.empty()) return false;
-    auto readVec=[&](const std::string& path,std::vector<float>& vec){
+    
+    auto readVec = [](const std::string& path) -> std::vector<float> {
+        std::vector<float> vec;
         std::ifstream f(path);
-        if(!f.good()) return false;
+        if(!f.good()) return vec;
+        
         std::string line;
         while(std::getline(f,line)){
-            if(line.empty()) continue;
+            if(line.empty() || line[0]=='#') continue;
             size_t comma = line.find(',');
             if(comma==std::string::npos) continue;
             std::string valStr = line.substr(comma+1);
             float v = std::stof(valStr);
             vec.push_back(v);
         }
-        return !vec.empty();
+        return vec;
     };
-    std::vector<float> vc,vm,vy,vd;
-    if(!readVec(base+"dye_density_c.csv",vc)) return false;
-    if(!readVec(base+"dye_density_m.csv",vm)) return false;
-    if(!readVec(base+"dye_density_y.csv",vy)) return false;
-    readVec(base+"dye_density_min.csv",vd);
-    int n=vc.size(); if(count) *count=n;
-    for(int i=0;i<n;i++){c[i]=vc[i];m[i]=vm[i];y[i]=vy[i]; dmin[i]=(i<vd.size()?vd[i]:0.f);} return true; } 
+    
+    auto cVec = readVec(base+"dye_density_c.csv");
+    auto mVec = readVec(base+"dye_density_m.csv");
+    auto yVec = readVec(base+"dye_density_y.csv");
+    auto dminVec = readVec(base+"dye_density_min.csv");
+    
+    if(cVec.empty() || mVec.empty() || yVec.empty()) return false;
+    
+    int n = std::min({(int)cVec.size(), (int)mVec.size(), (int)yVec.size(), 200});
+    for(int i=0; i<n; i++){
+        c[i] = cVec[i];
+        m[i] = mVec[i];
+        y[i] = yVec[i];
+        dmin[i] = dminVec.empty() ? 0.0f : (i < (int)dminVec.size() ? dminVec[i] : 0.0f);
+    }
+    *count = n;
+    
+    printf("DEBUG: Loaded %d spectral samples\n", n);
+    return true;
+}
+
+extern "C" bool loadIlluminantSPD(const char* name, float* spd, int* count) {
+    printf("DEBUG: loadIlluminantSPD for '%s'\n", name);
+    
+    // Map illuminant names to pre-computed arrays from CIE1931.cuh
+    // These will be populated by including the header and accessing the constants
+    if(strcmp(name, "D50") == 0) {
+        // Will be filled by caller with c_d50SPD
+        *count = 81;
+        return true;
+    } else if(strcmp(name, "D65") == 0) {
+        // Will be filled by caller with c_d65SPD
+        *count = 81;
+        return true;
+    } else if(strcmp(name, "K75P") == 0) {
+        // Will be filled by caller with c_k75pSPD
+        *count = 81;
+        return true;
+    } else {
+        printf("DEBUG: Unknown illuminant '%s', defaulting to D50\n", name);
+        *count = 81;
+        return true;  // Caller will use D50 as fallback
+    }
+} 

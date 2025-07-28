@@ -8,7 +8,7 @@ ifeq ($(UNAME_SYSTEM), Linux)
 	NVCCFLAGS = --compiler-options="-fPIC" -use_fast_math
 	LDFLAGS = -shared -L${CUDAPATH}/lib64 -lcuda -lcudart -Wl,-rpath,'$$ORIGIN'
 	BUNDLE_DIR = AgXEmulsionPlugin.ofx.bundle/Contents/Linux-x86-64/
-	CUDA_OBJ = EmulsionKernel.o DiffusionHalationKernel.o GrainKernel.o PaperKernel.o
+	CUDA_OBJ = EmulsionKernel.o DirCouplerKernel.o DiffusionHalationKernel.o GrainKernel.o PaperKernel.o
 	CXXFLAGS_PLUGIN = -I.. -I../ref/grain_ofx/OpenFX-1.4/include -I../ref/grain_ofx/Support/include -Wall -Wextra -std=gnu++11 -fPIC -I${CUDAPATH}/include
 endif
 
@@ -24,6 +24,9 @@ AgXEmulsionPlugin.ofx: AgXEmulsionPlugin.o ${CUDA_OBJ} ofxsCore.o ofxsImageEffec
 	cp libAgXLUT.so $(BUNDLE_DIR)
 
 EmulsionKernel.o: EmulsionKernel.cu
+	${NVCC} -c $< $(NVCCFLAGS)
+
+DirCouplerKernel.o: DirCouplerKernel.cu
 	${NVCC} -c $< $(NVCCFLAGS)
 
 DiffusionHalationKernel.o: DiffusionHalationKernel.cu

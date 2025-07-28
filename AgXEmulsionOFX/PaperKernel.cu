@@ -14,6 +14,14 @@ __constant__ float p_specM[200];
 __constant__ float p_specY[200];
 __constant__ float p_specDmin[200];
 __constant__ int  p_specN;
+__constant__ float c_viewSPD[81];
+__constant__ float c_catScale[3];
+
+extern "C" void UploadViewSPDCUDA(const float* spd,int n){
+    if(n>81) n=81;
+    cudaMemcpyToSymbol(c_viewSPD,spd,n*sizeof(float));
+    printf("UploadViewSPDCUDA DEBUG: Uploaded %d SPD samples (first3=%f %f %f)\n",n, spd[0], spd[1], spd[2]);
+}
 
 __device__ __forceinline__ float lerpP(float a,float b,float t){return a+(b-a)*t;}
 
@@ -115,16 +123,13 @@ __global__ void PaperKernel(float* img, int width, int height) {
         float spectralDensity = pr * p_specC[i] + pg * p_specM[i] + pb * p_specY[i] + p_specDmin[i];
         
         // Convert to transmitted light
-        float light = __powf(10.0f, -spectralDensity);
+        float transmittedLight = __powf(10.0f, -spectralDensity);
         
-        // Weight by illuminant SPD
-        float illuminant = c_d50SPD[j];
-        
-        // Integrate with CIE color matching functions
-        X += light * illuminant * c_xBar[j];
-        Y += light * illuminant * c_yBar[j];
-        Z += light * illuminant * c_zBar[j];
-        normY += illuminant * c_yBar[j];
+        // Weight by viewing illuminant and accumulate XYZ
+        X += transmittedLight * c_viewSPD[j] * c_xBar[j];
+        Y += transmittedLight * c_viewSPD[j] * c_yBar[j];
+        Z += transmittedLight * c_viewSPD[j] * c_zBar[j];
+        normY += c_viewSPD[j] * c_yBar[j];
     }
     
     // Normalize by illuminant
@@ -133,6 +138,17 @@ __global__ void PaperKernel(float* img, int width, int height) {
         Y /= normY; 
         Z /= normY;
     }
+    // Bradford CAT to D65
+    // Convert XYZ to LMS, apply scale, convert back
+    float L =  0.8951f*X + 0.2664f*Y - 0.1614f*Z;
+    float Mv= -0.7502f*X + 1.7135f*Y + 0.0367f*Z;
+    float S  =  0.0389f*X - 0.0685f*Y + 1.0296f*Z;
+    L*=c_catScale[0];
+    Mv*=c_catScale[1];
+    S*=c_catScale[2];
+    X = 0.9869929f*L + 0.4323053f*Mv - 0.0085287f*S;
+    Y =-0.1470543f*L + 0.5183603f*Mv + 0.0400428f*S;
+    Z = 0.1599627f*L + 0.0492912f*Mv + 0.9684867f*S;
     
     // Convert XYZ to linear sRGB (D50 → sRGB matrix)
     float R =  3.2406f * X - 1.5372f * Y - 0.4986f * Z;
@@ -192,6 +208,11 @@ extern "C" void UploadPaperSpectraCUDA(const float* c,const float* m,const float
     cudaMemcpyToSymbol(p_specN,&n,sizeof(int));
     
     printf("UploadPaperSpectraCUDA DEBUG: Upload completed\n");
+}
+
+extern "C" void UploadCATScaleCUDA(const float* scale){
+    cudaMemcpyToSymbol(c_catScale,scale,3*sizeof(float));
+    printf("UploadCATScaleCUDA DEBUG: scale=(%f,%f,%f)\n",scale[0],scale[1],scale[2]);
 }
 
 extern "C" void LaunchPaperCUDA(float* img, int width, int height) {
