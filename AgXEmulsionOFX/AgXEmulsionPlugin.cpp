@@ -1,158 +1,286 @@
 #include "AgXEmulsionPlugin.h"
-#include "ofxsCore.h"
+
+#include <stdio.h>
+#include <random>
+#include <iostream>
+
+#include "ofxsImageEffect.h"
 #include "ofxsMultiThread.h"
 #include "ofxsProcessing.h"
 #include "ofxsLog.h"
-#include <memory>
-#include <iostream>
+#include <cuda_runtime.h>
 
-using namespace OFX;
-namespace AgXEmu {
+#define kPluginName "AgX Emulsion"
+#define kPluginGrouping "OpenFX JQ"
+#define kPluginDescription "Apply AgX film emulation to RGB channels"
+#define kPluginIdentifier "com.JQ.AgXEmulsion"
+#define kPluginVersionMajor 1
+#define kPluginVersionMinor 0
+
+#define kSupportsTiles false
+#define kSupportsMultiResolution false
+#define kSupportsMultipleClipPARs false
 
 ////////////////////////////////////////////////////////////////////////////////
-// Processor stub – will eventually call CUDA kernels converted from agx_emulsion
-////////////////////////////////////////////////////////////////////////////////
-class AgXProcessor : public OFX::ImageProcessor {
+
+class AgXEmulsionProcessor : public OFX::ImageProcessor
+{
 public:
-    explicit AgXProcessor(OFX::ImageEffect& instance):OFX::ImageProcessor(instance){}
-    void setSrcImg(OFX::Image* src){_src=src;}
-    void setParams(int filmStock,double expEV,bool autoExp,int printPaper,double printExp,bool halActive,OfxRGBColourD halStrength){
-        _filmStock=filmStock;_expEV=expEV;_autoExp=autoExp;_printPaper=printPaper;_printExp=printExp;_halActive=halActive;_halStrength=halStrength;}
-    virtual void multiThreadProcessImages(OfxRectI procWindow) override {
-        // Just passthrough for now
-        for(int y=procWindow.y1;y<procWindow.y2;++y){
-            if(_effect.abort()) break;
-            float* dstPix = static_cast<float*>(_dstImg->getPixelAddress(procWindow.x1,y));
-            for(int x=procWindow.x1;x<procWindow.x2;++x){
-                float* srcPix = static_cast<float*>(_src? _src->getPixelAddress(x,y):nullptr);
-                if(srcPix){for(int c=0;c<4;++c) dstPix[c]=srcPix[c];}
-                else {for(int c=0;c<4;++c) dstPix[c]=0;}
-                dstPix+=4;
-            }
-        }
-    }
+    explicit AgXEmulsionProcessor(OFX::ImageEffect& p_Instance);
+
+    virtual void processImagesCUDA();
+    virtual void multiThreadProcessImages(OfxRectI p_ProcWindow);
+
+    void setSrcImg(OFX::Image* p_SrcImg);
+    void setParams(float p_invertStrength);
+    void setFrameTime(double frameTime) {_frameTime = frameTime; }
 private:
-    OFX::Image* _src=nullptr;
-    int _filmStock;
-    double _expEV;
-    bool _autoExp;
-    int _printPaper; double _printExp; bool _halActive; OfxRGBColourD _halStrength;
+    OFX::Image* _srcImg;
+    float _invertStrength;
+    double _frameTime;
 };
 
-////////////////////////////////////////////////////////////////////////////////
-// Plugin class implementation
-////////////////////////////////////////////////////////////////////////////////
-AgXPlugin::AgXPlugin(OfxImageEffectHandle handle):ImageEffect(handle){
-    _dstClip = fetchClip(kOfxImageEffectOutputClipName);
-    _srcClip = fetchClip(kOfxImageEffectSimpleSourceClipName);
-
-    _filmStock = fetchChoiceParam("filmStock");
-    _exposureCompEV = fetchDoubleParam("exposureCompEV");
-    _autoExposure = fetchBooleanParam("autoExposure");
-
-    _printPaper = fetchChoiceParam("printPaper");
-    _printExposure = fetchDoubleParam("printExposure");
-
-    _halationActive = fetchBooleanParam("halationActive");
-    _halationStrength = fetchRGBParam("halationStrength");
+AgXEmulsionProcessor::AgXEmulsionProcessor(OFX::ImageEffect& p_Instance)
+    : OFX::ImageProcessor(p_Instance)
+{
 }
 
-void AgXPlugin::render(const OFX::RenderArguments& args){
-    AgXProcessor proc(*this);
-    setupAndProcess(proc,args);
+extern void LaunchInvertCUDA(float* img, int width, int height, float strength);
+
+void AgXEmulsionProcessor::processImagesCUDA()
+{
+    const OfxRectI& bounds = _srcImg->getBounds();
+    const int width  = bounds.x2 - bounds.x1;
+    const int height = bounds.y2 - bounds.y1;
+
+    float* srcPtr = static_cast<float*>(_srcImg->getPixelData());
+    float* dstPtr = static_cast<float*>(_dstImg->getPixelData());
+    size_t bytes   = static_cast<size_t>(width) * height * 4 * sizeof(float);
+
+    // Copy input image to output on the device so we can modify in-place
+    cudaMemcpy(dstPtr, srcPtr, bytes, cudaMemcpyDeviceToDevice);
+
+    // Launch simple invert kernel (device pointers)
+    LaunchInvertCUDA(dstPtr, width, height, _invertStrength);
 }
 
-bool AgXPlugin::isIdentity(const OFX::IsIdentityArguments& args, Clip*& identityClip, double& identityTime){
-    identityClip=_srcClip;
-    identityTime=args.time;
-    return true; // passthrough for now
-}
+void AgXEmulsionProcessor::multiThreadProcessImages(OfxRectI p_ProcWindow)
+{
+    for (int y = p_ProcWindow.y1; y < p_ProcWindow.y2; ++y)
+    {
+        if (_effect.abort()) break;
 
-void AgXPlugin::setupAndProcess(AgXProcessor& proc,const OFX::RenderArguments& args){
-    std::auto_ptr<Image> dst(_dstClip->fetchImage(args.time));
-    std::auto_ptr<Image> src(_srcClip->fetchImage(args.time));
-    proc.setDstImg(dst.get());
-    proc.setSrcImg(src.get());
+        float* dstPix = static_cast<float*>(_dstImg->getPixelAddress(p_ProcWindow.x1, y));
 
-    double hr,hg,hb; _halationStrength->getValueAtTime(args.time,hr,hg,hb);
-    OfxRGBColourD halStrength{hr,hg,hb};
-    int filmIdx; _filmStock->getValue(filmIdx);
-    int paperIdx; _printPaper->getValue(paperIdx);
-    proc.setParams(filmIdx, _exposureCompEV->getValue(), _autoExposure->getValue(), paperIdx, _printExposure->getValue(), _halationActive->getValue(), halStrength);
+        for (int x = p_ProcWindow.x1; x < p_ProcWindow.x2; ++x)
+        {
+            float* srcPix = static_cast<float*>(_srcImg ? _srcImg->getPixelAddress(x, y) : 0);
 
-    OfxRectI renderWindow = dst->getBounds();
-    proc.multiThreadProcessImages(renderWindow);
-}
+            // do we have a source image to scale up
+            if (srcPix)
+            {
+                dstPix[0] = srcPix[0];
+                dstPix[1] = srcPix[1];
+                dstPix[2] = srcPix[2];
+                dstPix[3] = srcPix[3];
+            }
+            else
+            {
+                // no src pixel here, be black and transparent
+                for (int c = 0; c < 4; ++c)
+                {
+                    dstPix[c] = 0;
+                }
+            }
 
-////////////////////////////////////////////////////////////////////////////////
-// Factory describe functions
-////////////////////////////////////////////////////////////////////////////////
-void AgXPluginFactory::describe(ImageEffectDescriptor& desc){
-    desc.setLabels(kAgXPluginName,kAgXPluginName,kAgXPluginName);
-    desc.setPluginGrouping(kAgXPluginGrouping);
-    desc.setPluginDescription(kAgXPluginDescription);
-    desc.addSupportedContext(eContextFilter);
-    desc.addSupportedBitDepth(eBitDepthFloat);
-    desc.setSupportsTiles(false);
-}
-
-void AgXPluginFactory::describeInContext(ImageEffectDescriptor& desc, ContextEnum /*context*/){
-    ClipDescriptor* srcClip = desc.defineClip(kOfxImageEffectSimpleSourceClipName);
-    srcClip->addSupportedComponent(ePixelComponentRGBA);
-
-    ClipDescriptor* dstClip = desc.defineClip(kOfxImageEffectOutputClipName);
-    dstClip->addSupportedComponent(ePixelComponentRGBA);
-
-    PageParamDescriptor* page = desc.definePageParam("Controls");
-
-    // Film stock choice
-    ChoiceParamDescriptor* choice = desc.defineChoiceParam("filmStock");
-    choice->setLabel("Film Stock");
-    choice->appendOption("Kodak Gold 200");
-    choice->appendOption("Kodak Portra 400");
-    choice->appendOption("Fujifilm C200");
-    choice->setDefault(0);
-    page->addChild(*choice);
-
-    // Exposure compensation
-    DoubleParamDescriptor* dparam = desc.defineDoubleParam("exposureCompEV");
-    dparam->setLabel("Exposure Comp EV");
-    dparam->setDefault(0.0); dparam->setRange(-10.0,10.0); dparam->setIncrement(0.1);
-    page->addChild(*dparam);
-
-    BooleanParamDescriptor* b = desc.defineBooleanParam("autoExposure");
-    b->setLabel("Auto Exposure"); b->setDefault(true);
-    page->addChild(*b);
-
-    // Print paper choice
-    ChoiceParamDescriptor* paper = desc.defineChoiceParam("printPaper");
-    paper->setLabel("Print Paper");
-    paper->appendOption("Kodak Supra Endura");
-    paper->appendOption("Fujifilm Crystal Archive");
-    paper->setDefault(0);
-    page->addChild(*paper);
-
-    dparam = desc.defineDoubleParam("printExposure");
-    dparam->setLabel("Print Exposure"); dparam->setDefault(1.0); dparam->setRange(0.0,5.0); dparam->setIncrement(0.05);
-    page->addChild(*dparam);
-
-    // Halation
-    b = desc.defineBooleanParam("halationActive");
-    b->setLabel("Halation Active"); b->setDefault(true);
-    page->addChild(*b);
-
-    RGBParamDescriptor* rgb = desc.defineRGBParam("halationStrength");
-    rgb->setLabel("Halation Strength %"); rgb->setDefault(3.0,0.3,0.1);
-    rgb->setRange(0.0,0.0,0.0, 100.0,100.0,100.0);
-    page->addChild(*rgb);
-}
-
-} // namespace AgXEmu 
-
-// Register factory with host
-namespace OFX {
-    void Plugin::getPluginIDs(PluginFactoryArray& p_FactoryArray){
-        static AgXEmu::AgXPluginFactory agxFactory;
-        p_FactoryArray.push_back(&agxFactory);
+            // increment the dst pixel
+            dstPix += 4;
+        }
     }
-} // namespace OFX 
+}
+
+void AgXEmulsionProcessor::setSrcImg(OFX::Image* p_SrcImg)
+{
+    _srcImg = p_SrcImg;
+}
+
+void AgXEmulsionProcessor::setParams(float p_invertStrength)
+{
+    _invertStrength = p_invertStrength;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/** @brief The plugin that does our work */
+class AgXEmulsionPlugin : public OFX::ImageEffect
+{
+public:
+    explicit AgXEmulsionPlugin(OfxImageEffectHandle p_Handle);
+
+    /* Override the render */
+    virtual void render(const OFX::RenderArguments& p_Args);
+
+    /* Override is identity */
+    virtual bool isIdentity(const OFX::IsIdentityArguments& p_Args, OFX::Clip*& p_IdentityClip, double& p_IdentityTime);
+
+    /* Set up and run a processor */
+    void setupAndProcess(AgXEmulsionProcessor &p_AgXProcessor, const OFX::RenderArguments& p_Args);
+
+private:
+    // Does not own the following pointers
+    OFX::Clip* m_DstClip;
+    OFX::Clip* m_SrcClip;
+
+    OFX::DoubleParam* m_invertStrength;
+};
+
+AgXEmulsionPlugin::AgXEmulsionPlugin(OfxImageEffectHandle p_Handle)
+    : ImageEffect(p_Handle)
+{
+    m_DstClip = fetchClip(kOfxImageEffectOutputClipName);
+    m_SrcClip = fetchClip(kOfxImageEffectSimpleSourceClipName);
+
+    m_invertStrength = fetchDoubleParam("invertStrength");
+}
+
+void AgXEmulsionPlugin::render(const OFX::RenderArguments& p_Args)
+{
+    if ((m_DstClip->getPixelDepth() == OFX::eBitDepthFloat) && (m_DstClip->getPixelComponents() == OFX::ePixelComponentRGBA))
+    {
+        AgXEmulsionProcessor agxProcessor(*this);
+        agxProcessor.setFrameTime(p_Args.time);
+        setupAndProcess(agxProcessor, p_Args);
+    }
+    else
+    {
+        OFX::throwSuiteStatusException(kOfxStatErrUnsupported);
+    }
+}
+
+bool AgXEmulsionPlugin::isIdentity(const OFX::IsIdentityArguments& p_Args, OFX::Clip*& p_IdentityClip, double& p_IdentityTime)
+{
+    if (m_SrcClip)
+    {
+        p_IdentityClip = m_SrcClip;
+        p_IdentityTime = p_Args.time;
+        return true;
+    }
+    return false;
+}
+
+void AgXEmulsionPlugin::setupAndProcess(AgXEmulsionProcessor& p_AgXProcessor, const OFX::RenderArguments& p_Args)
+{
+    // Get the dst image
+    std::auto_ptr<OFX::Image> dst(m_DstClip->fetchImage(p_Args.time));
+    OFX::BitDepthEnum dstBitDepth = dst->getPixelDepth();
+    OFX::PixelComponentEnum dstComponents = dst->getPixelComponents();
+
+    // Get the src image
+    std::auto_ptr<OFX::Image> src(m_SrcClip->fetchImage(p_Args.time));
+    OFX::BitDepthEnum srcBitDepth = src->getPixelDepth();
+    OFX::PixelComponentEnum srcComponents = src->getPixelComponents();
+
+    // Check to see if the bit depth and number of components are the same
+    if ((srcBitDepth != dstBitDepth) || (srcComponents != dstComponents))
+    {
+        OFX::throwSuiteStatusException(kOfxStatErrValue);
+    }
+
+    double invertStrength = 0.0;
+    invertStrength = m_invertStrength->getValueAtTime(p_Args.time);
+    
+    // Set the images
+    p_AgXProcessor.setDstImg(dst.get());
+    p_AgXProcessor.setSrcImg(src.get());
+  
+    // Setup OpenCL and CUDA Render arguments
+    p_AgXProcessor.setGPURenderArgs(p_Args);
+
+    // Set the render window
+    p_AgXProcessor.setRenderWindow(p_Args.renderWindow);
+
+    // Set the parameters
+    p_AgXProcessor.setParams(invertStrength);
+
+    // Call the base class process member, this will call the derived templated process code
+    p_AgXProcessor.process();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+using namespace OFX;
+
+AgXEmulsionPluginFactory::AgXEmulsionPluginFactory()
+    : OFX::PluginFactoryHelper<AgXEmulsionPluginFactory>(kPluginIdentifier, kPluginVersionMajor, kPluginVersionMinor)
+{
+}
+
+void AgXEmulsionPluginFactory::describe(OFX::ImageEffectDescriptor& p_Desc)
+{
+    // Basic labels
+    p_Desc.setLabels(kPluginName, kPluginName, kPluginName);
+    p_Desc.setPluginGrouping(kPluginGrouping);
+    p_Desc.setPluginDescription(kPluginDescription);
+
+    // Add the supported contexts, only filter at the moment
+    p_Desc.addSupportedContext(eContextFilter);
+    p_Desc.addSupportedContext(eContextGeneral);
+
+    // Add supported pixel depths
+    p_Desc.addSupportedBitDepth(eBitDepthFloat);
+
+    // Set a few flags
+    p_Desc.setSingleInstance(false);
+    p_Desc.setHostFrameThreading(false);
+    p_Desc.setSupportsMultiResolution(kSupportsMultiResolution);
+    p_Desc.setSupportsTiles(kSupportsTiles);
+    p_Desc.setTemporalClipAccess(false);
+    p_Desc.setRenderTwiceAlways(false);
+    p_Desc.setSupportsMultipleClipPARs(kSupportsMultipleClipPARs);
+
+    // Setup CUDA render capability flags on non-Apple system
+#ifndef __APPLE__
+    p_Desc.setSupportsCudaRender(true);
+    p_Desc.setSupportsCudaStream(false);
+#endif
+}
+
+void AgXEmulsionPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, OFX::ContextEnum /*p_Context*/)
+{
+    // Source clip only in the filter context
+    // Create the mandated source clip
+    ClipDescriptor* srcClip = p_Desc.defineClip(kOfxImageEffectSimpleSourceClipName);
+    srcClip->addSupportedComponent(ePixelComponentRGBA);
+    srcClip->setTemporalClipAccess(false);
+    srcClip->setSupportsTiles(kSupportsTiles);
+    srcClip->setIsMask(false);
+
+    // Create the mandated output clip
+    ClipDescriptor* dstClip = p_Desc.defineClip(kOfxImageEffectOutputClipName);
+    dstClip->addSupportedComponent(ePixelComponentRGBA);
+    dstClip->addSupportedComponent(ePixelComponentAlpha);
+    dstClip->setSupportsTiles(kSupportsTiles);
+
+    // Make some pages and to things in
+    PageParamDescriptor* page = p_Desc.definePageParam("Controls");
+
+    // Invert strength parameter
+    DoubleParamDescriptor* param = p_Desc.defineDoubleParam("invertStrength");
+    param->setLabel("Invert Strength");
+    param->setHint("0.0 = no effect, 1.0 = full invert (CUDA demo)");
+    param->setDefault(0.0);
+    param->setRange(0.0, 1.0);
+    param->setIncrement(0.01);
+    param->setDisplayRange(0.0, 1.0);
+    page->addChild(*param);
+}
+
+ImageEffect* AgXEmulsionPluginFactory::createInstance(OfxImageEffectHandle p_Handle, ContextEnum /*p_Context*/)
+{
+    return new AgXEmulsionPlugin(p_Handle);
+}
+
+void OFX::Plugin::getPluginIDs(PluginFactoryArray& p_FactoryArray)
+{
+    static AgXEmulsionPluginFactory agxEmulsionPlugin;
+    p_FactoryArray.push_back(&agxEmulsionPlugin);
+} 

@@ -1,43 +1,31 @@
 UNAME_SYSTEM := $(shell uname -s)
-CXX          = g++
-
-# Paths to shared OFX helper library (reuse from grain plugin)
-SUPPORT_DIR  := ../ref/grain_ofx/Support
-OFX_INCLUDE  := ../ref/grain_ofx/OpenFX-1.4/include
-
-CXXFLAGS     = -I$(OFX_INCLUDE) -I$(SUPPORT_DIR)/include -Wall -Wextra -fPIC -std=gnu++11
+CXX = g++
+CXXFLAGS = -I../ref/grain_ofx/OpenFX-1.4/include -I../ref/grain_ofx/Support/include -Wall -Wextra
 
 ifeq ($(UNAME_SYSTEM), Linux)
-    LDFLAGS = -shared
-    BUNDLE_DIR = AgXEmulsionOFX.ofx.bundle/Contents/Linux-x86-64/
+	CXXFLAGS += -fPIC -std=gnu++11 -I${CUDAPATH}/include
+	CUDAPATH ?= /usr/local/cuda
+	NVCC = $(CUDAPATH)/bin/nvcc
+	NVCCFLAGS = --compiler-options="-fPIC" -use_fast_math
+	LDFLAGS = -shared -L${CUDAPATH}/lib64 -lcuda -lcudart
+	BUNDLE_DIR = AgXEmulsionPlugin.ofx.bundle/Contents/Linux-x86-64/
+	CUDA_OBJ = SimpleKernel.o
 endif
 
-PLUGIN_SRC   = AgXEmulsionPlugin.cpp
-PLUGIN_OBJ   = $(PLUGIN_SRC:.cpp=.o)
-
-SUPPORT_OBJS = ofxsCore.o ofxsImageEffect.o ofxsInteract.o ofxsLog.o \
-               ofxsMultiThread.o ofxsParams.o ofxsProperty.o ofxsPropertyValidation.o
-
-PLUGIN_LIB   = AgXEmulsionPlugin.ofx
-
-all: $(PLUGIN_LIB)
-
-$(PLUGIN_LIB): $(PLUGIN_OBJ) $(SUPPORT_OBJS)
+AgXEmulsionPlugin.ofx: AgXEmulsionPlugin.o ${CUDA_OBJ} ofxsCore.o ofxsImageEffect.o ofxsInteract.o ofxsLog.o ofxsMultiThread.o ofxsParams.o ofxsProperty.o ofxsPropertyValidation.o
 	$(CXX) $^ -o $@ $(LDFLAGS)
-	# Bundle directory structure
 	mkdir -p $(BUNDLE_DIR)
-	cp $@ $(BUNDLE_DIR)
+	cp AgXEmulsionPlugin.ofx $(BUNDLE_DIR)
 
-%.o: %.cpp
-	$(CXX) -c $< $(CXXFLAGS)
+SimpleKernel.o: SimpleKernel.cu
+	${NVCC} -c $< $(NVCCFLAGS)
 
-# Compile support library source files from Support/Library
-ofxs%.o: $(SUPPORT_DIR)/Library/ofxs%.cpp
+%.o: ../ref/grain_ofx/Support/Library/%.cpp
 	$(CXX) -c $< $(CXXFLAGS)
 
 clean:
 	rm -f *.o *.ofx
-	rm -rf AgXEmulsionOFX.ofx.bundle
+	rm -fr AgXEmulsionPlugin.ofx.bundle
 
-install: all
-	cp -fr AgXEmulsionOFX.ofx.bundle /usr/OFX/Plugins 
+install: AgXEmulsionPlugin.ofx
+	cp -fr AgXEmulsionPlugin.ofx.bundle /usr/OFX/Plugins 
