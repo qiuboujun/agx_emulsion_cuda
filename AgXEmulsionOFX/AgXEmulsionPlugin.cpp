@@ -225,29 +225,59 @@ void AgXEmulsionProcessor::processImagesCUDA()
     float* dstPtr = static_cast<float*>(_dstImg->getPixelData());
     size_t bytes   = static_cast<size_t>(width) * height * 4 * sizeof(float);
 
-    // Copy input image to output on the device so we can modify in-place
-    cudaMemcpy(dstPtr, srcPtr, bytes, cudaMemcpyDeviceToDevice);
+    // Determine if the src/dst pointers are on device or host
+    cudaPointerAttributes attrSrc{}, attrDst{};
+    bool srcIsDev=false, dstIsDev=false;
+    if(cudaPointerGetAttributes(&attrSrc, srcPtr)==cudaSuccess){ srcIsDev = (attrSrc.type == cudaMemoryTypeDevice); }
+    if(cudaPointerGetAttributes(&attrDst, dstPtr)==cudaSuccess){ dstIsDev = (attrDst.type == cudaMemoryTypeDevice); }
+
+    printf("DEBUG: srcIsDev=%d dstIsDev=%d\n", srcIsDev, dstIsDev);
+
+    float* devImg = nullptr;
+    if(srcIsDev && dstIsDev){
+        // simplest: copy src->dst on device and process in-place on dst
+        cudaError_t cpyErr = cudaMemcpy(dstPtr, srcPtr, bytes, cudaMemcpyDeviceToDevice);
+        if(cpyErr!=cudaSuccess){
+            printf("ERROR cudaMemcpy D2D: %s\n", cudaGetErrorString(cpyErr));
+            return;
+        }
+        devImg = dstPtr;
+    } else {
+        // allocate device buffer
+        cudaError_t allocErr = cudaMalloc(&devImg, bytes);
+        if(allocErr!=cudaSuccess){
+            printf("ERROR cudaMalloc devImg: %s\n", cudaGetErrorString(allocErr)); return; }
+        cudaError_t cpyErr = cudaMemcpy(devImg, srcPtr, bytes, srcIsDev?cudaMemcpyDeviceToDevice:cudaMemcpyHostToDevice);
+        if(cpyErr!=cudaSuccess){ printf("ERROR cudaMemcpy to dev: %s\n", cudaGetErrorString(cpyErr)); cudaFree(devImg); return; }
+    }
 
     if(lutOK){
         // === Negative development with DIR couplers ===
-        LaunchDirCouplerCUDA(dstPtr,width,height);
-        // Launch emulsion kernel
-        LaunchEmulsionCUDA(dstPtr, width, height, _gamma, _exposureEV);
+        LaunchDirCouplerCUDA(devImg,width,height);
+        // Launch emulsion kernel (or DIR pipeline which writes in-place)
+        LaunchEmulsionCUDA(devImg, width, height, _gamma, _exposureEV);
         // Apply diffusion + halation if enabled
         if(_radius > 0.1f || _halStrength > 1e-5f){
             printf("DEBUG: LaunchDiffusionHalation radius=%f hal=%f\n", _radius, _halStrength);
-            LaunchDiffusionHalationCUDA(dstPtr, width, height, _radius, _halStrength);
+            LaunchDiffusionHalationCUDA(devImg, width, height, _radius, _halStrength);
         }
 
         if(_grainStrength > 1e-5f){
             printf("DEBUG: LaunchGrain strength=%f seed=%u\n", _grainStrength, _grainSeed);
-            LaunchGrainCUDA(dstPtr, width, height, _grainStrength, _grainSeed);
+            LaunchGrainCUDA(devImg, width, height, _grainStrength, _grainSeed);
         }
 
         if(_paper[0]!='\0'){
             printf("DEBUG: LaunchPaperCUDA using %s\n", _paper);
-            LaunchPaperCUDA(dstPtr,width,height);
+            LaunchPaperCUDA(devImg,width,height);
         }
+    }
+
+    // Copy back to host if necessary
+    if(!(dstIsDev)){
+        cudaError_t backErr = cudaMemcpy(dstPtr, devImg, bytes, cudaMemcpyDeviceToHost);
+        if(backErr!=cudaSuccess){ printf("ERROR cudaMemcpy back: %s\n", cudaGetErrorString(backErr)); }
+        cudaFree(devImg);
     }
 }
 

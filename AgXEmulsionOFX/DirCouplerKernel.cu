@@ -11,19 +11,22 @@ __constant__ float c_sigmaPx;
 __constant__ float c_gaussK[25]; // radius<=12
 __constant__ int c_radius;
 
-__global__ void BuildGaussianKernel(float sigma){
+// Precompute Gaussian kernel on host and upload to constant memory
+
+static void BuildGaussianKernelHost(float sigma){
     int r = (int)roundf(3.0f*sigma);
     if(r<1) r=1; if(r>12) r=12;
-    if(threadIdx.x==0){
-        float sum=0.0f;
-        for(int i=-r;i<=r;i++){
-            float v=expf(-0.5f*i*i/(sigma*sigma));
-            ((float*)c_gaussK)[i+r]=v;
-            sum+=v;
-        }
-        for(int i=0;i<=2*r;i++) ((float*)c_gaussK)[i]/=sum;
-        *((int*)&c_radius)=r;
+    float hostK[25]={0};
+    float sum=0.0f;
+    for(int i=-r;i<=r;i++){
+        float v=expf(-0.5f*i*i/(sigma*sigma));
+        hostK[i+r]=v;
+        sum+=v;
     }
+    for(int i=0;i<=2*r;i++) hostK[i]/=sum;
+    // copy kernel and radius to device constant memory
+    cudaMemcpyToSymbol(c_gaussK,hostK,(2*r+1)*sizeof(float));
+    cudaMemcpyToSymbol(c_radius,&r,sizeof(int));
 }
 
 __device__ __forceinline__ int reflect(int idx,int len){return (idx<0)?-idx-1: (idx>=len)?2*len-idx-1: idx;}
@@ -58,14 +61,15 @@ __global__ void VerticalBlur(const float* in,float* out,int W,int H){
     }
 }
 
-__global__ void BuildCorrectionKernel(const float* density,const float* normD,float* corr,int W,int H){
-    int idx=blockIdx.x*blockDim.x+threadIdx.x;
-    int total=W*H;
+__global__ void BuildCorrectionKernel(const float* image,const float* normD,float* corr,int W,int H){
+    int idx = blockIdx.x*blockDim.x + threadIdx.x;
+    int total = W*H;
     if(idx>=total) return;
+    int base = idx*4; // float4 layout RGBA
     float3 d;
-    d.x=density[idx*3+0]/normD[0];
-    d.y=density[idx*3+1]/normD[1];
-    d.z=density[idx*3+2]/normD[2];
+    d.x = image[base+0] / normD[0];
+    d.y = image[base+1] / normD[1];
+    d.z = image[base+2] / normD[2];
     d.x+=c_highShift*d.x*d.x;
     d.y+=c_highShift*d.y*d.y;
     d.z+=c_highShift*d.z*d.z;
@@ -100,22 +104,23 @@ __device__ float lookupDensityCUDA(const float* curve,const float* logE,float va
     return lerpf(curve[lo],curve[lo+1],t);
 }
 
-__global__ void ApplyCorrectionKernel(float* logE,const float* corr,int W,int H){
+__global__ void ApplyCorrectionKernel(float* img,const float* corr,int W,int H){
     int idx=blockIdx.x*blockDim.x+threadIdx.x;
     if(idx>=W*H) return;
-    float3 corrv={corr[idx*3+0],corr[idx*3+1],corr[idx*3+2]};
+    int base = idx*4;
+    float3 corrv = {corr[idx*3+0], corr[idx*3+1], corr[idx*3+2]};
     float3 p;
-    p.x=logE[idx*3+0]-corrv.x;
-    p.y=logE[idx*3+1]-corrv.y;
-    p.z=logE[idx*3+2]-corrv.z;
+    p.x = img[base+0] - corrv.x;
+    p.y = img[base+1] - corrv.y;
+    p.z = img[base+2] - corrv.z;
     // re-interpolate density curves (gamma assumed 1 in negative stage)
     float dR=lookupDensityCUDA(c_curveR,c_logE,p.x);
     float dG=lookupDensityCUDA(c_curveG,c_logE,p.y);
     float dB=lookupDensityCUDA(c_curveB,c_logE,p.z);
     // convert to light transmission overwrite logE buffer with light (will feed print stage)
-    logE[idx*3+0]=powf(10.0f,-dR);
-    logE[idx*3+1]=powf(10.0f,-dG);
-    logE[idx*3+2]=powf(10.0f,-dB);
+    img[base+0] = powf(10.0f, -dR);
+    img[base+1] = powf(10.0f, -dG);
+    img[base+2] = powf(10.0f, -dB);
 }
 
 extern "C" void UploadDirMatrixCUDA(const float* M){cudaMemcpyToSymbol(c_dirM,M,9*sizeof(float));}
@@ -123,8 +128,12 @@ extern "C" void UploadDirParamsCUDA(const float* dmax,float highShift,float sigm
     cudaMemcpyToSymbol(c_dMax,dmax,3*sizeof(float));
     cudaMemcpyToSymbol(c_highShift,&highShift,sizeof(float));
     cudaMemcpyToSymbol(c_sigmaPx,&sigmaPx,sizeof(float));
-    BuildGaussianKernel<<<1,1>>>(sigmaPx);
-    cudaDeviceSynchronize();
+    if(sigmaPx>0.0f){
+        BuildGaussianKernelHost(sigmaPx);
+    } else {
+        int r=0;
+        cudaMemcpyToSymbol(c_radius,&r,sizeof(int));
+    }
 }
 
 extern "C" void LaunchDirCouplerCUDA(float* logE,int W,int H){
