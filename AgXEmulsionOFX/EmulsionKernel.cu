@@ -36,13 +36,10 @@ __global__ void EmulsionKernel(float* img, int width, int height)
     float logER = log10f(fmaxf(p.x,1e-6f)) + c_exposureEV*0.30103f;
     float logEG = log10f(fmaxf(p.y,1e-6f)) + c_exposureEV*0.30103f;
     float logEB = log10f(fmaxf(p.z,1e-6f)) + c_exposureEV*0.30103f;
-    float dR = lookupDensity(c_curveR,c_logE, logER/c_gamma);
-    float dG = lookupDensity(c_curveG,c_logE, logEG/c_gamma);
-    float dB = lookupDensity(c_curveB,c_logE, logEB/c_gamma);
-    // Store CMY density (negative film stage)
-    p.x = dR;
-    p.y = dG;
-    p.z = dB;
+    // Store log-exposure (raw) for DIR coupler stage
+    p.x = logER;
+    p.y = logEG;
+    p.z = logEB;
     pix[idx]=p;
 }
 

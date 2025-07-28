@@ -61,15 +61,29 @@ __global__ void VerticalBlur(const float* in,float* out,int W,int H){
     }
 }
 
+/* forward declarations so BuildCorrectionKernel can call density lookup */
+extern __constant__ float c_logE[601];
+extern __constant__ float c_curveR[601];
+extern __constant__ float c_curveG[601];
+extern __constant__ float c_curveB[601];
+extern __constant__ float c_gamma;
+__device__ float lookupDensityCUDA(const float* curve,const float* logE,float val);
+
 __global__ void BuildCorrectionKernel(const float* image,float* corr,int W,int H){
     int idx = blockIdx.x*blockDim.x + threadIdx.x;
     int total = W*H;
     if(idx>=total) return;
     int base = idx*4; // float4 layout RGBA
     float3 d;
-    d.x = image[base+0] / c_dMax[0];
-    d.y = image[base+1] / c_dMax[1];
-    d.z = image[base+2] / c_dMax[2];
+    float logR = image[base+0];
+    float logG = image[base+1];
+    float logB = image[base+2];
+    float densR = lookupDensityCUDA(c_curveR, c_logE, logR / c_gamma);
+    float densG = lookupDensityCUDA(c_curveG, c_logE, logG / c_gamma);
+    float densB = lookupDensityCUDA(c_curveB, c_logE, logB / c_gamma);
+    d.x = densR / c_dMax[0];
+    d.y = densG / c_dMax[1];
+    d.z = densB / c_dMax[2];
     d.x+=c_highShift*d.x*d.x;
     d.y+=c_highShift*d.y*d.y;
     d.z+=c_highShift*d.z*d.z;
@@ -81,12 +95,6 @@ __global__ void BuildCorrectionKernel(const float* image,float* corr,int W,int H
     corr[idx*3+1]=out.y;
     corr[idx*3+2]=out.z;
 }
-
-/* add extern LUT symbols */
-extern __constant__ float c_logE[601];
-extern __constant__ float c_curveR[601];
-extern __constant__ float c_curveG[601];
-extern __constant__ float c_curveB[601];
 
 __device__ __forceinline__ float lerpf(float a,float b,float t){return a+(b-a)*t;}
 __device__ float lookupDensityCUDA(const float* curve,const float* logE,float val){
