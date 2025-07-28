@@ -6,12 +6,19 @@ __constant__ float c_curveR[601];
 __constant__ float c_curveG[601];
 __constant__ float c_curveB[601];
 __constant__ float c_gamma;
+__constant__ float c_exposureEV;
 
 __device__ __forceinline__ float lerp(float a,float b,float t){return a+(b-a)*t;}
 
 __device__ float lookupDensity(const float* curve,const float* logE,float val){
-    if(val<=logE[0]) return curve[0];
-    if(val>=logE[600]) return curve[600];
+    if(val<=logE[0]){
+        float t=(val-logE[0])/(logE[1]-logE[0]);
+        return lerp(curve[0],curve[1],t); // extrapolate below
+    }
+    if(val>=logE[600]){
+        float t=(val-logE[599])/(logE[600]-logE[599]);
+        return lerp(curve[599],curve[600],t); // extrapolate above
+    }
     // linear search (601 small)
     int idx=0;
     for(int i=1;i<601;i++){if(val<logE[i]){idx=i-1;break;}}
@@ -26,25 +33,27 @@ __global__ void EmulsionKernel(float* img, int width, int height)
     if(idx>=total) return;
     float4* pix = reinterpret_cast<float4*>(img);
     float4 p = pix[idx];
-    float maxRGB = fmaxf(p.x,fmaxf(p.y,p.z));
-    maxRGB = fmaxf(maxRGB,1e-6f);
-    float logE = log10f(maxRGB);
-    float dR = lookupDensity(c_curveR,c_logE, logE/c_gamma);
-    float dG = lookupDensity(c_curveG,c_logE, logE/c_gamma);
-    float dB = lookupDensity(c_curveB,c_logE, logE/c_gamma);
-    // map density to display simple
-    p.x = 1.0f - exp2f(-dR);
-    p.y = 1.0f - exp2f(-dG);
-    p.z = 1.0f - exp2f(-dB);
+    float logER = log10f(fmaxf(p.x,1e-6f)) + c_exposureEV*0.30103f;
+    float logEG = log10f(fmaxf(p.y,1e-6f)) + c_exposureEV*0.30103f;
+    float logEB = log10f(fmaxf(p.z,1e-6f)) + c_exposureEV*0.30103f;
+    float dR = lookupDensity(c_curveR,c_logE, logER/c_gamma);
+    float dG = lookupDensity(c_curveG,c_logE, logEG/c_gamma);
+    float dB = lookupDensity(c_curveB,c_logE, logEB/c_gamma);
+    // Convert density to light transmission: T = 10^(-density)
+    p.x = __powf(10.0f, -dR);
+    p.y = __powf(10.0f, -dG);
+    p.z = __powf(10.0f, -dB);
+    // No clamping - linear light can go above 1.0
     pix[idx]=p;
 }
 
-extern "C" void LaunchEmulsionCUDA(float* img, int width, int height, float gamma)
+extern "C" void LaunchEmulsionCUDA(float* img, int width, int height, float gamma, float exposureEV)
 {
     int total = width * height;
     int block = 256;
     int grid = (total + block - 1) / block;
     cudaMemcpyToSymbol(c_gamma,&gamma,sizeof(float));
+    cudaMemcpyToSymbol(c_exposureEV,&exposureEV,sizeof(float));
     EmulsionKernel<<<grid, block>>>(img, width, height);
     cudaDeviceSynchronize();
 }

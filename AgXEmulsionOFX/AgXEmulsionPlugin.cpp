@@ -13,6 +13,8 @@
 #include <cstring>
 #include "EmulsionKernel.cuh"
 #include "DiffusionHalationKernel.cuh"
+#include "GrainKernel.cuh"
+#include "PaperKernel.cuh"
 
 #define kPluginName "AgX Emulsion"
 #define kPluginGrouping "OpenFX JQ"
@@ -51,15 +53,22 @@ public:
     float getGamma() const {return _gamma;}
 
     void setDiffusionHalation(float radius, float hal){ _radius = radius; _halStrength = hal; }
+    void setGrain(float strength,unsigned int seed){ _grainStrength=strength; _grainSeed=seed; }
+    void setExposure(float ev){ _exposureEV = ev; }
+    void setPrintPaper(const char* paper){ strncpy(_paper,paper,63); _paper[63]=0; }
 
 private:
     OFX::Image* _srcImg;
     // float _unused;
     double _frameTime;
     char _film[64];
+    char _paper[64];
     float _gamma;
     float _radius;
     float _halStrength;
+    float _grainStrength;
+    unsigned int _grainSeed;
+    float _exposureEV;
 };
 
 AgXEmulsionProcessor::AgXEmulsionProcessor(OFX::ImageEffect& p_Instance)
@@ -68,9 +77,13 @@ AgXEmulsionProcessor::AgXEmulsionProcessor(OFX::ImageEffect& p_Instance)
     _film[0] = '\0';  // Initialize as empty string
     _radius = 0.f;
     _halStrength = 0.f;
+    _grainStrength = 0.f;
+    _grainSeed = 0;
+    _exposureEV = 0.f;
+    _paper[0]='\0';
 }
 
-extern "C" void LaunchEmulsionCUDA(float* img, int width, int height, float gamma);
+extern "C" void LaunchEmulsionCUDA(float* img, int width, int height, float gamma, float exposureEV);
 
 void AgXEmulsionProcessor::processImagesCUDA()
 {
@@ -115,6 +128,13 @@ void AgXEmulsionProcessor::processImagesCUDA()
     } else {
         printf("DEBUG: Using cached LUT\n");
     }
+    // Load print LUT if paper selected
+    static char sPaper[64]="";
+    if(_paper[0]!='\0' && strcmp(_paper,sPaper)!=0){
+        static void* helperP=nullptr; static bool (*loadPrint)(const char*,float*,float*,float*,float*)=nullptr;
+        if(!helperP){ helperP=dlopen("libAgXLUT.so",RTLD_LAZY); if(helperP) loadPrint=(bool(*)(const char*,float*,float*,float*,float*))dlsym(helperP,"loadPrintLUT"); }
+        if(loadPrint){float logE[601],r[601],g[601],b[601]; if(loadPrint(_paper,logE,r,g,b)){ printf("DEBUG: Print LUT loaded ok\n"); UploadPaperLUTCUDA(logE,r,g,b); strncpy(sPaper,_paper,63); sPaper[63]=0;} else {printf("DEBUG: Print LUT load fail\n");}}
+    }
 
     const OfxRectI& bounds = _srcImg->getBounds();
     const int width  = bounds.x2 - bounds.x1;
@@ -129,11 +149,21 @@ void AgXEmulsionProcessor::processImagesCUDA()
 
     if(lutOK){
         // Launch emulsion kernel
-        LaunchEmulsionCUDA(dstPtr, width, height, _gamma);
+        LaunchEmulsionCUDA(dstPtr, width, height, _gamma, _exposureEV);
         // Apply diffusion + halation if enabled
         if(_radius > 0.1f || _halStrength > 1e-5f){
             printf("DEBUG: LaunchDiffusionHalation radius=%f hal=%f\n", _radius, _halStrength);
             LaunchDiffusionHalationCUDA(dstPtr, width, height, _radius, _halStrength);
+        }
+
+        if(_grainStrength > 1e-5f){
+            printf("DEBUG: LaunchGrain strength=%f seed=%u\n", _grainStrength, _grainSeed);
+            LaunchGrainCUDA(dstPtr, width, height, _grainStrength, _grainSeed);
+        }
+
+        if(_paper[0]!='\0'){
+            printf("DEBUG: LaunchPaperCUDA using %s\n", _paper);
+            LaunchPaperCUDA(dstPtr,width,height);
         }
     }
 }
@@ -202,8 +232,12 @@ private:
 
     OFX::ChoiceParam* m_filmStock;
     OFX::DoubleParam* m_gammaFactor;
+    OFX::DoubleParam* m_exposureEV;
+    OFX::ChoiceParam* m_printPaper;
     OFX::DoubleParam* m_diffusionRadius;
     OFX::DoubleParam* m_halationStrength;
+    OFX::DoubleParam* m_grainStrength;
+    OFX::IntParam*    m_grainSeed;
 };
 
 AgXEmulsionPlugin::AgXEmulsionPlugin(OfxImageEffectHandle p_Handle)
@@ -214,8 +248,12 @@ AgXEmulsionPlugin::AgXEmulsionPlugin(OfxImageEffectHandle p_Handle)
 
     m_filmStock = fetchChoiceParam("filmStock");
     m_gammaFactor = fetchDoubleParam("gammaFactor");
+    m_exposureEV = fetchDoubleParam("exposureEV");
+    m_printPaper = fetchChoiceParam("printPaper");
     m_diffusionRadius = fetchDoubleParam("diffusionRadius");
     m_halationStrength = fetchDoubleParam("halationStrength");
+    m_grainStrength   = fetchDoubleParam("grainStrength");
+    m_grainSeed       = fetchIntParam("grainSeed");
 }
 
 void AgXEmulsionPlugin::render(const OFX::RenderArguments& p_Args)
@@ -265,14 +303,23 @@ void AgXEmulsionPlugin::setupAndProcess(AgXEmulsionProcessor& p_AgXProcessor, co
     printf("DEBUG: Film name = %s\n", filmName);
     
     double gamma = m_gammaFactor->getValueAtTime(p_Args.time);
-    printf("DEBUG: Gamma from param = %f\n", gamma);
-
+    double exposure = m_exposureEV->getValueAtTime(p_Args.time);
     double radius = m_diffusionRadius->getValueAtTime(p_Args.time);
     double hal   = m_halationStrength->getValueAtTime(p_Args.time);
-    printf("DEBUG: Radius from param = %f, Halation = %f\n", radius, hal);
+    double grain = m_grainStrength->getValueAtTime(p_Args.time);
+    int    gseed = m_grainSeed->getValueAtTime(p_Args.time);
+    int paperIdx; m_printPaper->getValueAtTime(p_Args.time,paperIdx);
+    const char* paperMap[] = {"", "kodak_2383", "kodak_2393", "fujifilm_crystal_archive_typeii", "kodak_ektacolor_edge", "kodak_endura_premier", "kodak_portra_endura", "kodak_supra_endura", "kodak_ultra_endura"};
+    const char* paperName = paperIdx<9?paperMap[paperIdx]:"";
+    printf("DEBUG: PrintPaper idx=%d name=%s\n",paperIdx,paperName);
+    printf("DEBUG: ExposureEV = %f Radius = %f Halation = %f\n", exposure, radius, hal);
+    printf("DEBUG: Grain strength = %f seed=%d\n", grain, gseed);
  
     p_AgXProcessor.setFilmGamma(filmName,(float)gamma);
     p_AgXProcessor.setDiffusionHalation((float)radius,(float)hal);
+    p_AgXProcessor.setExposure((float)exposure);
+    p_AgXProcessor.setPrintPaper(paperName);
+    p_AgXProcessor.setGrain((float)grain,(unsigned int)gseed);
 
     // Setup OpenCL and CUDA Render arguments
     p_AgXProcessor.setGPURenderArgs(p_Args);
@@ -350,6 +397,16 @@ void AgXEmulsionPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_D
     fchoice->setDefault(0);
     page->addChild(*fchoice);
 
+    // Exposure EV
+    DoubleParamDescriptor* eparam = p_Desc.defineDoubleParam("exposureEV");
+    eparam->setLabel("Exposure EV");
+    eparam->setHint("Exposure adjustment in stops (log2)");
+    eparam->setDefault(0.0);
+    eparam->setRange(-4.0,4.0);
+    eparam->setIncrement(0.1);
+    eparam->setDisplayRange(-4.0,4.0);
+    page->addChild(*eparam);
+
     // Gamma factor
     DoubleParamDescriptor* gparam = p_Desc.defineDoubleParam("gammaFactor");
     gparam->setLabel("Gamma Factor");
@@ -379,6 +436,40 @@ void AgXEmulsionPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_D
     hparam->setIncrement(0.01);
     hparam->setDisplayRange(0.0,1.0);
     page->addChild(*hparam);
+
+    // Grain strength
+    DoubleParamDescriptor* gs = p_Desc.defineDoubleParam("grainStrength");
+    gs->setLabel("Grain Strength");
+    gs->setHint("Amount of grain noise");
+    gs->setDefault(0.1);
+    gs->setRange(0.0,1.0);
+    gs->setIncrement(0.01);
+    gs->setDisplayRange(0.0,1.0);
+    page->addChild(*gs);
+
+    // Grain seed
+    IntParamDescriptor* gseed = p_Desc.defineIntParam("grainSeed");
+    gseed->setLabel("Grain Seed");
+    gseed->setHint("Random seed for grain pattern");
+    gseed->setDefault(0);
+    gseed->setRange(0,100000);
+    gseed->setDisplayRange(0,100000);
+    page->addChild(*gseed);
+
+    // Print paper choice
+    ChoiceParamDescriptor* pchoice = p_Desc.defineChoiceParam("printPaper");
+    pchoice->setLabel("Print Paper");
+    pchoice->appendOption("None");
+    pchoice->appendOption("Kodak 2383");
+    pchoice->appendOption("Kodak 2393");
+    pchoice->appendOption("Fujifilm Crystal Archive Type II");
+    pchoice->appendOption("Kodak Ektacolor Edge");
+    pchoice->appendOption("Kodak Endura Premier");
+    pchoice->appendOption("Kodak Portra Endura");
+    pchoice->appendOption("Kodak Supra Endura");
+    pchoice->appendOption("Kodak Ultra Endura");
+    pchoice->setDefault(1);
+    page->addChild(*pchoice);
 }
 
 ImageEffect* AgXEmulsionPluginFactory::createInstance(OfxImageEffectHandle p_Handle, ContextEnum /*p_Context*/)

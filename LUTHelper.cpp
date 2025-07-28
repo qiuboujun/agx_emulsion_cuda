@@ -50,6 +50,7 @@ extern "C" bool loadFilmLUT(const char* stock, float* logE, float* r, float* g, 
         std::string test = root + stock + "/";
         printf("DEBUG LUT: Trying path: %s\n", test.c_str());
         std::ifstream f(test+"density_curve_r.csv");
+        if(!f.good()) f.open((test+"dye_density_y.csv").c_str());
         if(f.good()){ 
             printf("DEBUG LUT: Found data at: %s\n", test.c_str());
             base = test; 
@@ -94,5 +95,47 @@ extern "C" bool loadFilmLUT(const char* stock, float* logE, float* r, float* g, 
         logE[i] = r[i] = g[i] = b[i] = 0.0f;
     }
     
+    return true;
+} 
+
+extern "C" bool loadPrintLUT(const char* stock, float* logE, float* r, float* g, float* b) {
+    printf("DEBUG LUT PRINT: Searching for print stock '%s'\n", stock);
+    std::vector<std::string> roots;
+    roots.push_back("../data/paper/");
+    roots.push_back("./data/paper/");
+    roots.push_back("/usr/OFX/Plugins/data/paper/");
+    Dl_info info;
+    if(dladdr((void*)&loadPrintLUT,&info) && info.dli_fname){
+        std::string libPath(info.dli_fname);
+        size_t pos = libPath.find_last_of('/') ;
+        if(pos!=std::string::npos){
+            std::string dir = libPath.substr(0,pos+1);
+            roots.push_back(dir+"../../../data/paper/");
+        }
+    }
+    std::string base="";
+    for(const auto& root: roots){
+        std::string test = root + stock + "/";
+        std::ifstream f(test+"density_curve_r.csv");
+        if(f.good()){ base = test; break; }
+    }
+    if(base.empty()) return false;
+    std::vector<float> x, yr, yg, yb;
+    bool ok=false;
+    if(loadCurve(base+"density_curve_r.csv", x, yr)){
+        std::vector<float> xg; if(!loadCurve(base+"density_curve_g.csv", xg, yg)) return false;
+        std::vector<float> xb; if(!loadCurve(base+"density_curve_b.csv", xb, yb)) return false;
+        ok=true;
+    } else {
+        if(loadCurve(base+"dye_density_y.csv", x, yr)){
+            std::vector<float> xg; if(!loadCurve(base+"dye_density_m.csv", xg, yg)) return false;
+            std::vector<float> xb; if(!loadCurve(base+"dye_density_c.csv", xb, yb)) return false;
+            ok=true;
+        }
+    }
+    if(!ok) return false;
+    size_t n = std::min((size_t)601, x.size());
+    for(size_t i=0;i<n;i++){logE[i]=x[i]; r[i]=yr[i]; g[i]=yg[i]; b[i]=yb[i];}
+    for(size_t i=n;i<601;i++){logE[i]=r[i]=g[i]=b[i]=0.f;}
     return true;
 } 

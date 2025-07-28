@@ -2,7 +2,7 @@
 #include <cuda_runtime.h>
 #include "DiffusionHalationKernel.cuh"
 
-#define MAX_RADIUS 10
+#define MAX_RADIUS 25
 
 __device__ __forceinline__ int clampi(int v, int lo, int hi) {return v < lo ? lo : (v > hi ? hi : v);} 
 
@@ -14,19 +14,22 @@ __global__ void DiffusionHalationKernel(float* img, int width, int height, int s
 
     int index = (y * width + x) * 4; // RGBA float
 
-    // compute blurred red component (box blur)
+    // Gaussian blur on red channel
+    float sigma = rad * 0.5f + 1e-3f;
+    float twoSigma2 = 2.0f * sigma * sigma;
     float sumR = 0.f;
-    int count = 0;
+    float wsum = 0.f;
     for(int dy=-rad; dy<=rad; ++dy){
         int yy = clampi(y + dy, 0, height-1);
         for(int dx=-rad; dx<=rad; ++dx){
             int xx = clampi(x + dx, 0, width-1);
+            float w = __expf(-(dx*dx + dy*dy)/twoSigma2);
             int idx = (yy * width + xx) * 4;
-            sumR += img[idx]; // red
-            count++;
+            sumR += w * img[idx];
+            wsum += w;
         }
     }
-    float blurR = sumR / (float)count;
+    float blurR = sumR / wsum;
 
     // original red
     float origR = img[index];
