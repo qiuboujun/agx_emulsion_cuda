@@ -9,6 +9,9 @@
 #include "ofxsProcessing.h"
 #include "ofxsLog.h"
 #include <cuda_runtime.h>
+#include <dlfcn.h>
+#include <cstring>
+#include "EmulsionKernel.cuh"
 
 #define kPluginName "AgX Emulsion"
 #define kPluginGrouping "OpenFX JQ"
@@ -32,12 +35,17 @@ public:
     virtual void multiThreadProcessImages(OfxRectI p_ProcWindow);
 
     void setSrcImg(OFX::Image* p_SrcImg);
-    void setParams(float p_invertStrength);
+    // void setParams(float p_invertStrength);
     void setFrameTime(double frameTime) {_frameTime = frameTime; }
+    void setFilmGamma(const std::string& film,float gamma){_film=film;_gamma=gamma;}
+    const std::string& getFilm() const {return _film;}
+    float getGamma() const {return _gamma;}
 private:
     OFX::Image* _srcImg;
-    float _invertStrength;
+    // float _unused;
     double _frameTime;
+    std::string _film;
+    float _gamma;
 };
 
 AgXEmulsionProcessor::AgXEmulsionProcessor(OFX::ImageEffect& p_Instance)
@@ -45,10 +53,31 @@ AgXEmulsionProcessor::AgXEmulsionProcessor(OFX::ImageEffect& p_Instance)
 {
 }
 
-extern void LaunchInvertCUDA(float* img, int width, int height, float strength);
+extern "C" void LaunchEmulsionCUDA(float* img, int width, int height, float gamma);
 
 void AgXEmulsionProcessor::processImagesCUDA()
 {
+    static char sFilm[64]="";
+    static float sGamma=-1.0f;
+    bool lutOK=true;
+    if(_film!="" && (strcmp(_film.c_str(),sFilm)!=0 || _gamma!=sGamma)){
+        static void* helper = nullptr;
+        static bool (*loadFn)(const char*,float*,float*,float*,float*) = nullptr;
+        if(!helper){
+            helper = dlopen("libAgXLUT.so", RTLD_LAZY);
+            if(helper) loadFn = (bool(*)(const char*,float*,float*,float*,float*))dlsym(helper,"loadFilmLUT");
+        }
+        if(loadFn){
+            float logE[601], r[601], g[601], b[601];
+            if(loadFn && loadFn(_film.c_str(),logE,r,g,b)){
+                UploadLUTCUDA(logE,r,g,b);
+                strncpy(sFilm,_film.c_str(),63); sFilm[63]=0;
+                sGamma=_gamma;
+            } else {
+                lutOK=false;
+            }
+        }
+    }
     const OfxRectI& bounds = _srcImg->getBounds();
     const int width  = bounds.x2 - bounds.x1;
     const int height = bounds.y2 - bounds.y1;
@@ -60,8 +89,10 @@ void AgXEmulsionProcessor::processImagesCUDA()
     // Copy input image to output on the device so we can modify in-place
     cudaMemcpy(dstPtr, srcPtr, bytes, cudaMemcpyDeviceToDevice);
 
-    // Launch simple invert kernel (device pointers)
-    LaunchInvertCUDA(dstPtr, width, height, _invertStrength);
+    if(lutOK){
+        // Launch emulsion kernel
+        LaunchEmulsionCUDA(dstPtr, width, height, _gamma);
+    }
 }
 
 void AgXEmulsionProcessor::multiThreadProcessImages(OfxRectI p_ProcWindow)
@@ -104,10 +135,6 @@ void AgXEmulsionProcessor::setSrcImg(OFX::Image* p_SrcImg)
     _srcImg = p_SrcImg;
 }
 
-void AgXEmulsionProcessor::setParams(float p_invertStrength)
-{
-    _invertStrength = p_invertStrength;
-}
 
 ////////////////////////////////////////////////////////////////////////////////
 /** @brief The plugin that does our work */
@@ -130,7 +157,8 @@ private:
     OFX::Clip* m_DstClip;
     OFX::Clip* m_SrcClip;
 
-    OFX::DoubleParam* m_invertStrength;
+    OFX::ChoiceParam* m_filmStock;
+    OFX::DoubleParam* m_gammaFactor;
 };
 
 AgXEmulsionPlugin::AgXEmulsionPlugin(OfxImageEffectHandle p_Handle)
@@ -139,7 +167,8 @@ AgXEmulsionPlugin::AgXEmulsionPlugin(OfxImageEffectHandle p_Handle)
     m_DstClip = fetchClip(kOfxImageEffectOutputClipName);
     m_SrcClip = fetchClip(kOfxImageEffectSimpleSourceClipName);
 
-    m_invertStrength = fetchDoubleParam("invertStrength");
+    m_filmStock = fetchChoiceParam("filmStock");
+    m_gammaFactor = fetchDoubleParam("gammaFactor");
 }
 
 void AgXEmulsionPlugin::render(const OFX::RenderArguments& p_Args)
@@ -185,8 +214,9 @@ void AgXEmulsionPlugin::setupAndProcess(AgXEmulsionProcessor& p_AgXProcessor, co
         OFX::throwSuiteStatusException(kOfxStatErrValue);
     }
 
-    double invertStrength = 0.0;
-    invertStrength = m_invertStrength->getValueAtTime(p_Args.time);
+    int filmIdx; m_filmStock->getValueAtTime(p_Args.time, filmIdx);
+    std::string filmName = filmIdx==0?"kodak_portra_400":"kodak_vision3_250d";
+    double gamma = m_gammaFactor->getValueAtTime(p_Args.time);
     
     // Set the images
     p_AgXProcessor.setDstImg(dst.get());
@@ -199,7 +229,7 @@ void AgXEmulsionPlugin::setupAndProcess(AgXEmulsionProcessor& p_AgXProcessor, co
     p_AgXProcessor.setRenderWindow(p_Args.renderWindow);
 
     // Set the parameters
-    p_AgXProcessor.setParams(invertStrength);
+    p_AgXProcessor.setFilmGamma(filmName,(float)gamma);
 
     // Call the base class process member, this will call the derived templated process code
     p_AgXProcessor.process();
@@ -263,15 +293,23 @@ void AgXEmulsionPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_D
     // Make some pages and to things in
     PageParamDescriptor* page = p_Desc.definePageParam("Controls");
 
-    // Invert strength parameter
-    DoubleParamDescriptor* param = p_Desc.defineDoubleParam("invertStrength");
-    param->setLabel("Invert Strength");
-    param->setHint("0.0 = no effect, 1.0 = full invert (CUDA demo)");
-    param->setDefault(0.0);
-    param->setRange(0.0, 1.0);
-    param->setIncrement(0.01);
-    param->setDisplayRange(0.0, 1.0);
-    page->addChild(*param);
+    // Film stock choice
+    ChoiceParamDescriptor* fchoice = p_Desc.defineChoiceParam("filmStock");
+    fchoice->setLabel("Film Stock");
+    fchoice->appendOption("Kodak Portra 400");
+    fchoice->appendOption("Kodak Vision3 250D");
+    fchoice->setDefault(0);
+    page->addChild(*fchoice);
+
+    // Gamma factor
+    DoubleParamDescriptor* gparam = p_Desc.defineDoubleParam("gammaFactor");
+    gparam->setLabel("Gamma Factor");
+    gparam->setHint("Density curve gamma scaling");
+    gparam->setDefault(1.0);
+    gparam->setRange(0.5,2.0);
+    gparam->setIncrement(0.01);
+    gparam->setDisplayRange(0.5,2.0);
+    page->addChild(*gparam);
 }
 
 ImageEffect* AgXEmulsionPluginFactory::createInstance(OfxImageEffectHandle p_Handle, ContextEnum /*p_Context*/)
