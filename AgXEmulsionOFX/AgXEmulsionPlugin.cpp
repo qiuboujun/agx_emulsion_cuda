@@ -12,10 +12,10 @@
 #include <dlfcn.h>
 #include <cstring>
 #include "EmulsionKernel.cuh"
-#include "DirCouplerKernel.cuh"
 #include "DiffusionHalationKernel.cuh"
 #include "GrainKernel.cuh"
 #include "PaperKernel.cuh"
+#include "DirCouplerKernel.cuh"
 #include "CIE1931.cuh"
 
 #define kPluginName "AgX Emulsion"
@@ -58,13 +58,6 @@ public:
     void setGrain(float strength,unsigned int seed){ _grainStrength=strength; _grainSeed=seed; }
     void setExposure(float ev){ _exposureEV = ev; }
     void setPrintPaper(const char* paper){ strncpy(_paper,paper,63); _paper[63]=0; }
-    void setDirCouplers(float amount, float diffusion, float diffusionUm, float highShift) {
-        _dirAmount = amount;
-        _dirDiffusion = diffusion;
-        _dirDiffusionUm = diffusionUm;
-        _dirHighShift = highShift;
-    }
-    void setPixelSize(float pixelSizeUm) { _pixelSizeUm = pixelSizeUm; }
 
 private:
     OFX::Image* _srcImg;
@@ -78,11 +71,6 @@ private:
     float _grainStrength;
     unsigned int _grainSeed;
     float _exposureEV;
-    float _dirAmount;
-    float _dirDiffusion;
-    float _dirDiffusionUm;
-    float _dirHighShift;
-    float _pixelSizeUm;
 };
 
 AgXEmulsionProcessor::AgXEmulsionProcessor(OFX::ImageEffect& p_Instance)
@@ -95,14 +83,9 @@ AgXEmulsionProcessor::AgXEmulsionProcessor(OFX::ImageEffect& p_Instance)
     _grainSeed = 0;
     _exposureEV = 0.f;
     _paper[0]='\0';
-    _dirAmount = 1.0f;
-    _dirDiffusion = 2.0f;
-    _dirDiffusionUm = 10.0f;
-    _dirHighShift = 0.0f;
-    _pixelSizeUm = 2.0f;
 }
 
-extern "C" void LaunchEmulsionCUDA(float4* d_pixels, int width, int height, float exposureEV);
+extern "C" void LaunchEmulsionCUDA(float* img, int width, int height, float gamma, float exposureEV);
 
 void AgXEmulsionProcessor::processImagesCUDA()
 {
@@ -133,46 +116,10 @@ void AgXEmulsionProcessor::processImagesCUDA()
             bool loaded = loadFn(_film,logE,r,g,b);
             printf("DEBUG: loadFn result = %s\n", loaded ? "SUCCESS" : "FAILED");
             if(loaded){
-                UploadLUTCUDA(logE,r,g,b,_gamma);
-                
-                // Setup DIR-coupler parameters
-                // Compute 3x3 DIR matrix from amount*ratio and interlayer diffusion
-                // This matches compute_dir_couplers_matrix() from Python
-                float M[9];
-                float dirRatioRGB[3] = {1.0f, 1.0f, 1.0f}; // Default from JSON (ratio_rgb)
-                float dirAmountRGB[3] = {_dirAmount * dirRatioRGB[0], 
-                                        _dirAmount * dirRatioRGB[1], 
-                                        _dirAmount * dirRatioRGB[2]};
-                
-                // Simple 1D Gaussian diffusion model (layer_diffusion = _dirDiffusion)
-                // Identity matrix with Gaussian blur across layers
-                M[0] = dirAmountRGB[0]; M[1] = 0.0f; M[2] = 0.0f;  // R->CMY
-                M[3] = 0.0f; M[4] = dirAmountRGB[1]; M[5] = 0.0f;  // G->CMY
-                M[6] = 0.0f; M[7] = 0.0f; M[8] = dirAmountRGB[2];  // B->CMY
-                
-                // Apply simple diffusion (approximation)
-                if(_dirDiffusion > 0.1f) {
-                    float blur = 1.0f / (1.0f + _dirDiffusion);
-                    M[1] = M[3] = (1.0f - blur) * 0.5f * dirAmountRGB[0];
-                    M[2] = M[6] = (1.0f - blur) * 0.3f * dirAmountRGB[0];
-                    M[0] *= blur;
-                    M[4] *= blur;
-                    M[8] *= blur;
-                }
-                
-                // Compute density max (approximation based on common values)
-                float dMax[3] = {3.0f, 3.0f, 3.0f}; // Typical max density
-                
-                // Convert physical size to pixel sigma
-                float sigmaPx = _dirDiffusionUm / _pixelSizeUm;
-                
-                // Upload DIR parameters
-                UploadDirMatrixCUDA(M);
-                UploadDirParamsCUDA(dMax, _dirHighShift, sigmaPx);
-                
+                UploadLUTCUDA(logE,r,g,b);
                 strncpy(sFilm,_film,63); sFilm[63]=0;
                 sGamma=_gamma;
-                printf("DEBUG: LUT and DIR-coupler uploaded successfully\n");
+                printf("DEBUG: LUT uploaded successfully\n");
             } else {
                 lutOK=false;
             }
@@ -261,7 +208,7 @@ void AgXEmulsionProcessor::processImagesCUDA()
 
     if(lutOK){
         // Launch emulsion kernel
-        LaunchEmulsionCUDA((float4*)dstPtr, width, height, _exposureEV);
+        LaunchEmulsionCUDA(dstPtr, width, height, _gamma, _exposureEV);
         // Apply diffusion + halation if enabled
         if(_radius > 0.1f || _halStrength > 1e-5f){
             printf("DEBUG: LaunchDiffusionHalation radius=%f hal=%f\n", _radius, _halStrength);
@@ -350,13 +297,6 @@ private:
     OFX::DoubleParam* m_halationStrength;
     OFX::DoubleParam* m_grainStrength;
     OFX::IntParam*    m_grainSeed;
-    
-    // DIR-coupler parameters
-    OFX::DoubleParam* m_dirAmount;
-    OFX::DoubleParam* m_dirDiffusion;
-    OFX::DoubleParam* m_dirDiffusionUm;
-    OFX::DoubleParam* m_dirHighShift;
-    OFX::DoubleParam* m_pixelSizeUm;
 };
 
 AgXEmulsionPlugin::AgXEmulsionPlugin(OfxImageEffectHandle p_Handle)
@@ -373,13 +313,6 @@ AgXEmulsionPlugin::AgXEmulsionPlugin(OfxImageEffectHandle p_Handle)
     m_halationStrength = fetchDoubleParam("halationStrength");
     m_grainStrength   = fetchDoubleParam("grainStrength");
     m_grainSeed       = fetchIntParam("grainSeed");
-    
-    // DIR-coupler parameters
-    m_dirAmount = fetchDoubleParam("dirAmount");
-    m_dirDiffusion = fetchDoubleParam("dirDiffusion");
-    m_dirDiffusionUm = fetchDoubleParam("dirDiffusionUm");
-    m_dirHighShift = fetchDoubleParam("dirHighShift");
-    m_pixelSizeUm = fetchDoubleParam("pixelSizeUm");
 }
 
 void AgXEmulsionPlugin::render(const OFX::RenderArguments& p_Args)
@@ -437,27 +370,15 @@ void AgXEmulsionPlugin::setupAndProcess(AgXEmulsionProcessor& p_AgXProcessor, co
     int paperIdx; m_printPaper->getValueAtTime(p_Args.time,paperIdx);
     const char* paperMap[] = {"", "kodak_2383", "kodak_2393", "fujifilm_crystal_archive_typeii", "kodak_ektacolor_edge", "kodak_endura_premier", "kodak_portra_endura", "kodak_supra_endura", "kodak_ultra_endura"};
     const char* paperName = paperIdx<9?paperMap[paperIdx]:"";
-    
-    // DIR-coupler parameters
-    double dirAmount = m_dirAmount->getValueAtTime(p_Args.time);
-    double dirDiffusion = m_dirDiffusion->getValueAtTime(p_Args.time);  
-    double dirDiffusionUm = m_dirDiffusionUm->getValueAtTime(p_Args.time);
-    double dirHighShift = m_dirHighShift->getValueAtTime(p_Args.time);
-    double pixelSizeUm = m_pixelSizeUm->getValueAtTime(p_Args.time);
-    
     printf("DEBUG: PrintPaper idx=%d name=%s\n",paperIdx,paperName);
     printf("DEBUG: ExposureEV = %f Radius = %f Halation = %f\n", exposure, radius, hal);
     printf("DEBUG: Grain strength = %f seed=%d\n", grain, gseed);
-    printf("DEBUG: DIR Amount = %f Diffusion = %f DiffusionUm = %f HighShift = %f PixelSizeUm = %f\n", 
-           dirAmount, dirDiffusion, dirDiffusionUm, dirHighShift, pixelSizeUm);
  
     p_AgXProcessor.setFilmGamma(filmName,(float)gamma);
     p_AgXProcessor.setDiffusionHalation((float)radius,(float)hal);
     p_AgXProcessor.setExposure((float)exposure);
     p_AgXProcessor.setPrintPaper(paperName);
     p_AgXProcessor.setGrain((float)grain,(unsigned int)gseed);
-    p_AgXProcessor.setDirCouplers((float)dirAmount, (float)dirDiffusion, (float)dirDiffusionUm, (float)dirHighShift);
-    p_AgXProcessor.setPixelSize((float)pixelSizeUm);
 
     // Setup OpenCL and CUDA Render arguments
     p_AgXProcessor.setGPURenderArgs(p_Args);
@@ -608,56 +529,6 @@ void AgXEmulsionPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_D
     pchoice->appendOption("Kodak Ultra Endura");
     pchoice->setDefault(1);
     page->addChild(*pchoice);
-
-    // DIR-coupler Amount
-    DoubleParamDescriptor* dirAmountParam = p_Desc.defineDoubleParam("dirAmount");
-    dirAmountParam->setLabel("DIR Amount");
-    dirAmountParam->setHint("DIR coupler inhibition strength (0-1)");
-    dirAmountParam->setDefault(1.0);
-    dirAmountParam->setRange(0.0,1.0);
-    dirAmountParam->setIncrement(0.01);
-    dirAmountParam->setDisplayRange(0.0,1.0);
-    page->addChild(*dirAmountParam);
-
-    // DIR-coupler Diffusion Interlayer
-    DoubleParamDescriptor* dirDiffusionParam = p_Desc.defineDoubleParam("dirDiffusion");
-    dirDiffusionParam->setLabel("DIR Diffusion Inter-Layer");
-    dirDiffusionParam->setHint("Gaussian diffusion between emulsion layers (0-5)");
-    dirDiffusionParam->setDefault(2.0);
-    dirDiffusionParam->setRange(0.0,5.0);
-    dirDiffusionParam->setIncrement(0.1);
-    dirDiffusionParam->setDisplayRange(0.0,5.0);
-    page->addChild(*dirDiffusionParam);
-
-    // DIR-coupler Diffusion Size
-    DoubleParamDescriptor* dirDiffusionUmParam = p_Desc.defineDoubleParam("dirDiffusionUm");
-    dirDiffusionUmParam->setLabel("DIR Diffusion Size µm");
-    dirDiffusionUmParam->setHint("Physical XY diffusion size in micrometers (0-100)");
-    dirDiffusionUmParam->setDefault(10.0);
-    dirDiffusionUmParam->setRange(0.0,100.0);
-    dirDiffusionUmParam->setIncrement(1.0);
-    dirDiffusionUmParam->setDisplayRange(0.0,100.0);
-    page->addChild(*dirDiffusionUmParam);
-
-    // DIR-coupler High Exposure Shift
-    DoubleParamDescriptor* dirHighShiftParam = p_Desc.defineDoubleParam("dirHighShift");
-    dirHighShiftParam->setLabel("DIR High-Exposure Shift");
-    dirHighShiftParam->setHint("Quadratic term for high exposure inhibition (0-1)");
-    dirHighShiftParam->setDefault(0.0);
-    dirHighShiftParam->setRange(0.0,1.0);
-    dirHighShiftParam->setIncrement(0.01);
-    dirHighShiftParam->setDisplayRange(0.0,1.0);
-    page->addChild(*dirHighShiftParam);
-
-    // Pixel Size
-    DoubleParamDescriptor* pixelSizeParam = p_Desc.defineDoubleParam("pixelSizeUm");
-    pixelSizeParam->setLabel("Pixel Size µm");
-    pixelSizeParam->setHint("Physical pixel size in micrometers for diffusion calculations");
-    pixelSizeParam->setDefault(2.0);
-    pixelSizeParam->setRange(0.5,10.0);
-    pixelSizeParam->setIncrement(0.1);
-    pixelSizeParam->setDisplayRange(0.5,10.0);
-    page->addChild(*pixelSizeParam);
 }
 
 ImageEffect* AgXEmulsionPluginFactory::createInstance(OfxImageEffectHandle p_Handle, ContextEnum /*p_Context*/)
