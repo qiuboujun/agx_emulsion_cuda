@@ -133,7 +133,17 @@ void AgXEmulsionProcessor::processImagesCUDA()
     if(_paper[0]!='\0' && strcmp(_paper,sPaper)!=0){
         static void* helperP=nullptr; static bool (*loadPrint)(const char*,float*,float*,float*,float*)=nullptr;
         if(!helperP){ helperP=dlopen("libAgXLUT.so",RTLD_LAZY); if(helperP) loadPrint=(bool(*)(const char*,float*,float*,float*,float*))dlsym(helperP,"loadPrintLUT"); }
-        if(loadPrint){float logE[601],r[601],g[601],b[601]; if(loadPrint(_paper,logE,r,g,b)){ printf("DEBUG: Print LUT loaded ok\n"); UploadPaperLUTCUDA(logE,r,g,b); strncpy(sPaper,_paper,63); sPaper[63]=0;} else {printf("DEBUG: Print LUT load fail\n");}}
+        if(loadPrint){float logE[601],r[601],g[601],b[601]; if(loadPrint(_paper,logE,r,g,b)){ printf("DEBUG: Print LUT loaded ok\n"); UploadPaperLUTCUDA(logE,r,g,b);
+            // load spectra
+            static bool (*loadSpec)(const char*,float*,float*,float*,float*,int* )=nullptr;
+            if(!loadSpec){ loadSpec = (bool(*)(const char*,float*,float*,float*,float*,int*))dlsym(helperP,"loadPaperSpectra"); }
+            float cSpec[200],mSpec[200],ySpec[200],dmin[200]; int nSpec=0;
+            if(loadSpec && loadSpec(_paper,cSpec,mSpec,ySpec,dmin,&nSpec)){
+               UploadPaperSpectraCUDA(cSpec,mSpec,ySpec,dmin,nSpec);
+               printf("DEBUG: Spectra uploaded N=%d\n",nSpec);
+            } else {printf("DEBUG: Spectra load fail\n");}
+
+            strncpy(sPaper,_paper,63); sPaper[63]=0;} else {printf("DEBUG: Print LUT load fail\n");}}
     }
 
     const OfxRectI& bounds = _srcImg->getBounds();

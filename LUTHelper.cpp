@@ -134,8 +134,42 @@ extern "C" bool loadPrintLUT(const char* stock, float* logE, float* r, float* g,
         }
     }
     if(!ok) return false;
+    printf("DEBUG PRINT LUT: Loaded %zu samples, logE range [%f, %f]\n", 
+           x.size(), x.empty() ? 0.0f : x[0], x.empty() ? 0.0f : x[x.size()-1]);
+    printf("DEBUG PRINT LUT: Sample curves R[0]=%f R[last]=%f\n", 
+           yr.empty() ? 0.0f : yr[0], yr.empty() ? 0.0f : yr[yr.size()-1]);
+    
     size_t n = std::min((size_t)601, x.size());
     for(size_t i=0;i<n;i++){logE[i]=x[i]; r[i]=yr[i]; g[i]=yg[i]; b[i]=yb[i];}
     for(size_t i=n;i<601;i++){logE[i]=r[i]=g[i]=b[i]=0.f;}
     return true;
 } 
+
+extern "C" bool loadPaperSpectra(const char* stock,float* c,float* m,float* y,float* dmin,int* count){
+    printf("DEBUG SPECTRA: Loading paper spectra '%s'\n",stock);
+    std::vector<std::string> roots={"../data/paper/","./data/paper/","/usr/OFX/Plugins/data/paper/"};
+    Dl_info info; if(dladdr((void*)&loadPaperSpectra,&info)&&info.dli_fname){std::string libPath(info.dli_fname);size_t pos=libPath.find_last_of('/');if(pos!=std::string::npos){roots.push_back(libPath.substr(0,pos+1)+"../../../data/paper/");}}
+    std::string base="";
+    for(const auto& r:roots){std::string test=r+stock+"/";std::ifstream f(test+"dye_density_c.csv");if(f.good()){base=test;break;}}
+    if(base.empty()) return false;
+    auto readVec=[&](const std::string& path,std::vector<float>& vec){
+        std::ifstream f(path);
+        if(!f.good()) return false;
+        std::string line;
+        while(std::getline(f,line)){
+            if(line.empty()) continue;
+            size_t comma = line.find(',');
+            if(comma==std::string::npos) continue;
+            std::string valStr = line.substr(comma+1);
+            float v = std::stof(valStr);
+            vec.push_back(v);
+        }
+        return !vec.empty();
+    };
+    std::vector<float> vc,vm,vy,vd;
+    if(!readVec(base+"dye_density_c.csv",vc)) return false;
+    if(!readVec(base+"dye_density_m.csv",vm)) return false;
+    if(!readVec(base+"dye_density_y.csv",vy)) return false;
+    readVec(base+"dye_density_min.csv",vd);
+    int n=vc.size(); if(count) *count=n;
+    for(int i=0;i<n;i++){c[i]=vc[i];m[i]=vm[i];y[i]=vy[i]; dmin[i]=(i<vd.size()?vd[i]:0.f);} return true; } 
