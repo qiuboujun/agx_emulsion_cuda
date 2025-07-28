@@ -223,7 +223,9 @@ void AgXEmulsionProcessor::processImagesCUDA()
 
     float* srcPtr = static_cast<float*>(_srcImg->getPixelData());
     float* dstPtr = static_cast<float*>(_dstImg->getPixelData());
-    size_t bytes   = static_cast<size_t>(width) * height * 4 * sizeof(float);
+    size_t contigRowBytes = static_cast<size_t>(width) * 4 * sizeof(float);
+    size_t srcRowBytes = _srcImg->getRowBytes();
+    size_t dstRowBytes = _dstImg->getRowBytes();
 
     // Determine if the src/dst pointers are on device or host
     cudaPointerAttributes attrSrc{}, attrDst{};
@@ -231,31 +233,38 @@ void AgXEmulsionProcessor::processImagesCUDA()
     if(cudaPointerGetAttributes(&attrSrc, srcPtr)==cudaSuccess){ srcIsDev = (attrSrc.type == cudaMemoryTypeDevice); }
     if(cudaPointerGetAttributes(&attrDst, dstPtr)==cudaSuccess){ dstIsDev = (attrDst.type == cudaMemoryTypeDevice); }
 
-    printf("DEBUG: srcIsDev=%d dstIsDev=%d\n", srcIsDev, dstIsDev);
+    printf("DEBUG: srcIsDev=%d dstIsDev=%d srcRowBytes=%zu dstRowBytes=%zu contig=%zu\n", srcIsDev, dstIsDev, srcRowBytes, dstRowBytes, contigRowBytes);
 
     float* devImg = nullptr;
-    if(srcIsDev && dstIsDev){
-        // simplest: copy src->dst on device and process in-place on dst
-        cudaError_t cpyErr = cudaMemcpy(dstPtr, srcPtr, bytes, cudaMemcpyDeviceToDevice);
-        if(cpyErr!=cudaSuccess){
-            printf("ERROR cudaMemcpy D2D: %s\n", cudaGetErrorString(cpyErr));
-            return;
-        }
+    bool inPlaceOK = (srcIsDev && dstIsDev && srcRowBytes==contigRowBytes && dstRowBytes==contigRowBytes);
+    if(inPlaceOK){
+        // Fast path: contiguous buffers on device, copy then process in place
+        cudaError_t err = cudaMemcpy(dstPtr, srcPtr, contigRowBytes*height, cudaMemcpyDeviceToDevice);
+        if(err!=cudaSuccess){ printf("ERROR cudaMemcpy D2D: %s\n", cudaGetErrorString(err)); return; }
         devImg = dstPtr;
     } else {
-        // allocate device buffer
-        cudaError_t allocErr = cudaMalloc(&devImg, bytes);
-        if(allocErr!=cudaSuccess){
-            printf("ERROR cudaMalloc devImg: %s\n", cudaGetErrorString(allocErr)); return; }
-        cudaError_t cpyErr = cudaMemcpy(devImg, srcPtr, bytes, srcIsDev?cudaMemcpyDeviceToDevice:cudaMemcpyHostToDevice);
-        if(cpyErr!=cudaSuccess){ printf("ERROR cudaMemcpy to dev: %s\n", cudaGetErrorString(cpyErr)); cudaFree(devImg); return; }
+        // Allocate contiguous staging buffer on device
+        size_t totalBytes = contigRowBytes*height;
+        cudaError_t allocErr = cudaMalloc(&devImg, totalBytes);
+        if(allocErr!=cudaSuccess){ printf("ERROR cudaMalloc devImg: %s\n", cudaGetErrorString(allocErr)); return; }
+
+        // Copy each row taking pitch into account
+        for(int y=0;y<height;y++){
+            const void* srcRowPtr = (const char*)srcPtr + y*srcRowBytes;
+            void* dstRowPtr = (char*)devImg + y*contigRowBytes;
+            cudaMemcpyKind kind;
+            if(srcIsDev) kind = cudaMemcpyDeviceToDevice; else kind = cudaMemcpyHostToDevice;
+            cudaError_t err = cudaMemcpy(dstRowPtr, srcRowPtr, contigRowBytes, kind);
+            if(err!=cudaSuccess){ printf("ERROR row copy to dev y=%d err=%s\n", y, cudaGetErrorString(err)); cudaFree(devImg); return; }
+        }
     }
 
     if(lutOK){
         // === Negative development with DIR couplers ===
-        LaunchDirCouplerCUDA(devImg,width,height);
-        // Launch emulsion kernel (or DIR pipeline which writes in-place)
+        // Step 1: logE ➜ CMY density
         LaunchEmulsionCUDA(devImg, width, height, _gamma, _exposureEV);
+        // Step 2: apply DIR inhibition, converts back to light
+        LaunchDirCouplerCUDA(devImg,width,height);
         // Apply diffusion + halation if enabled
         if(_radius > 0.1f || _halStrength > 1e-5f){
             printf("DEBUG: LaunchDiffusionHalation radius=%f hal=%f\n", _radius, _halStrength);
@@ -273,10 +282,15 @@ void AgXEmulsionProcessor::processImagesCUDA()
         }
     }
 
-    // Copy back to host if necessary
-    if(!(dstIsDev)){
-        cudaError_t backErr = cudaMemcpy(dstPtr, devImg, bytes, cudaMemcpyDeviceToHost);
-        if(backErr!=cudaSuccess){ printf("ERROR cudaMemcpy back: %s\n", cudaGetErrorString(backErr)); }
+    // Copy back if destination is host or if pitch differs
+    if(!inPlaceOK){
+        for(int y=0;y<height;y++){
+            void* dstRowPtr = (char*)dstPtr + y*dstRowBytes;
+            const void* srcRowPtr = (const char*)devImg + y*contigRowBytes;
+            cudaMemcpyKind kind = dstIsDev? cudaMemcpyDeviceToDevice : cudaMemcpyDeviceToHost;
+            cudaError_t err = cudaMemcpy(dstRowPtr, srcRowPtr, contigRowBytes, kind);
+            if(err!=cudaSuccess){ printf("ERROR copy back row y=%d err=%s\n", y, cudaGetErrorString(err)); }
+        }
         cudaFree(devImg);
     }
 }

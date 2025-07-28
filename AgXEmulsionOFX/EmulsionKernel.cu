@@ -39,11 +39,10 @@ __global__ void EmulsionKernel(float* img, int width, int height)
     float dR = lookupDensity(c_curveR,c_logE, logER/c_gamma);
     float dG = lookupDensity(c_curveG,c_logE, logEG/c_gamma);
     float dB = lookupDensity(c_curveB,c_logE, logEB/c_gamma);
-    // Convert density to light transmission: T = 10^(-density)
-    p.x = __powf(10.0f, -dR);
-    p.y = __powf(10.0f, -dG);
-    p.z = __powf(10.0f, -dB);
-    // No clamping - linear light can go above 1.0
+    // Store CMY density (negative film stage)
+    p.x = dR;
+    p.y = dG;
+    p.z = dB;
     pix[idx]=p;
 }
 

@@ -61,15 +61,15 @@ __global__ void VerticalBlur(const float* in,float* out,int W,int H){
     }
 }
 
-__global__ void BuildCorrectionKernel(const float* image,const float* normD,float* corr,int W,int H){
+__global__ void BuildCorrectionKernel(const float* image,float* corr,int W,int H){
     int idx = blockIdx.x*blockDim.x + threadIdx.x;
     int total = W*H;
     if(idx>=total) return;
     int base = idx*4; // float4 layout RGBA
     float3 d;
-    d.x = image[base+0] / normD[0];
-    d.y = image[base+1] / normD[1];
-    d.z = image[base+2] / normD[2];
+    d.x = image[base+0] / c_dMax[0];
+    d.y = image[base+1] / c_dMax[1];
+    d.z = image[base+2] / c_dMax[2];
     d.x+=c_highShift*d.x*d.x;
     d.y+=c_highShift*d.y*d.y;
     d.z+=c_highShift*d.z*d.z;
@@ -136,7 +136,7 @@ extern "C" void UploadDirParamsCUDA(const float* dmax,float highShift,float sigm
     }
 }
 
-extern "C" void LaunchDirCouplerCUDA(float* logE,int W,int H){
+extern "C" void LaunchDirCouplerCUDA(float* img,int W,int H){
     int total=W*H;
     dim3 blk(256);
     dim3 grd((total+255)/256);
@@ -144,7 +144,7 @@ extern "C" void LaunchDirCouplerCUDA(float* logE,int W,int H){
     float* d_corr; cudaMalloc(&d_corr,total*3*sizeof(float));
     float* d_tmp; cudaMalloc(&d_tmp,total*3*sizeof(float));
     // Build correction
-    BuildCorrectionKernel<<<grd,blk>>>(logE,c_dMax,d_corr,W,H);
+    BuildCorrectionKernel<<<grd,blk>>>(img,d_corr,W,H);
     cudaDeviceSynchronize();
     int r; cudaMemcpyFromSymbol(&r,c_radius,sizeof(int));
     if(r>0){
@@ -154,7 +154,7 @@ extern "C" void LaunchDirCouplerCUDA(float* logE,int W,int H){
         cudaDeviceSynchronize();
     }
     // apply correction
-    ApplyCorrectionKernel<<<grd,blk>>>(logE,d_corr,W,H);
+    ApplyCorrectionKernel<<<grd,blk>>>(img,d_corr,W,H);
     cudaDeviceSynchronize();
     cudaFree(d_corr); cudaFree(d_tmp);
 } 
