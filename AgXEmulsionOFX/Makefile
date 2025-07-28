@@ -1,21 +1,21 @@
 UNAME_SYSTEM := $(shell uname -s)
 CXX = g++
-CXXFLAGS = -I.. -I../ref/grain_ofx/OpenFX-1.4/include -I../ref/grain_ofx/Support/include -Wall -Wextra -std=gnu++11
+CXXFLAGS = -I.. -I../ref/grain_ofx/OpenFX-1.4/include -I../ref/grain_ofx/Support/include -Wall -Wextra -std=gnu++11 -fPIC
 
 ifeq ($(UNAME_SYSTEM), Linux)
-	CXXFLAGS += -fPIC -I${CUDAPATH}/include
-	CUDAPATH ?= /usr/local/cuda
+	CUDAPATH = /usr/local/cuda
 	NVCC = $(CUDAPATH)/bin/nvcc
 	NVCCFLAGS = --compiler-options="-fPIC" -use_fast_math
-	LDFLAGS = -shared -L${CUDAPATH}/lib64 -lcuda -lcudart -ldl -Wl,-rpath,'$$ORIGIN'
+	LDFLAGS = -shared -L${CUDAPATH}/lib64 -lcuda -lcudart -Wl,-rpath,'$$ORIGIN'
 	BUNDLE_DIR = AgXEmulsionPlugin.ofx.bundle/Contents/Linux-x86-64/
-	CUDA_OBJ = EmulsionKernel.o
+	CUDA_OBJ = EmulsionKernel.o DiffusionHalationKernel.o
+	CXXFLAGS_PLUGIN = -I.. -I../ref/grain_ofx/OpenFX-1.4/include -I../ref/grain_ofx/Support/include -Wall -Wextra -std=gnu++11 -fPIC -I${CUDAPATH}/include
 endif
 
 all: AgXEmulsionPlugin.ofx libAgXLUT.so
 
 libAgXLUT.so: ../LUTHelper.cpp
-	$(CXX) -shared -std=gnu++11 -fPIC $< -o $@ -ldl -Wl,-rpath,'$$ORIGIN'
+	$(CXX) -shared -std=gnu++11 -fPIC $< -o $@ -Wl,-rpath,'$$ORIGIN'
 
 AgXEmulsionPlugin.ofx: AgXEmulsionPlugin.o ${CUDA_OBJ} ofxsCore.o ofxsImageEffect.o ofxsInteract.o ofxsLog.o ofxsMultiThread.o ofxsParams.o ofxsProperty.o ofxsPropertyValidation.o libAgXLUT.so
 	$(CXX) $(filter-out libAgXLUT.so,$^) -o $@ $(LDFLAGS)
@@ -25,6 +25,12 @@ AgXEmulsionPlugin.ofx: AgXEmulsionPlugin.o ${CUDA_OBJ} ofxsCore.o ofxsImageEffec
 
 EmulsionKernel.o: EmulsionKernel.cu
 	${NVCC} -c $< $(NVCCFLAGS)
+
+DiffusionHalationKernel.o: DiffusionHalationKernel.cu
+	${NVCC} -c $< $(NVCCFLAGS)
+
+AgXEmulsionPlugin.o: AgXEmulsionPlugin.cpp
+	$(CXX) -c $< $(CXXFLAGS_PLUGIN)
 
 %.o: ../ref/grain_ofx/Support/Library/%.cpp
 	$(CXX) -c $< $(CXXFLAGS)

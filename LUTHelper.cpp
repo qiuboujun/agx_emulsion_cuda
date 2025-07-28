@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include <dlfcn.h>
+#include <cstdio> // Required for printf
 
 static bool loadCurve(const std::string& path, std::vector<float>& x, std::vector<float>& y) {
     std::ifstream f(path);
@@ -23,14 +24,19 @@ static bool loadCurve(const std::string& path, std::vector<float>& x, std::vecto
 }
 
 extern "C" bool loadFilmLUT(const char* stock, float* logE, float* r, float* g, float* b) {
+    printf("DEBUG LUT: Searching for stock '%s'\n", stock);
+    
     std::vector<std::string> roots;
     // caller provided relative default (from Resolve cwd)
     roots.push_back("../data/film/negative/");
     roots.push_back("./data/film/negative/");
+    // system-wide OFX plugins directory (Resolve/Natron common install)
+    roots.push_back("/usr/OFX/Plugins/data/film/negative/");
     // path relative to library directory
     Dl_info info;
     if(dladdr((void*)&loadFilmLUT,&info) && info.dli_fname){
         std::string libPath(info.dli_fname);
+        printf("DEBUG LUT: Library path: %s\n", libPath.c_str());
         size_t pos = libPath.find_last_of('/') ;
         if(pos!=std::string::npos){
             std::string dir = libPath.substr(0,pos+1); // dir of .so
@@ -42,15 +48,38 @@ extern "C" bool loadFilmLUT(const char* stock, float* logE, float* r, float* g, 
     std::string base="";
     for(const auto& root: roots){
         std::string test = root + stock + "/";
+        printf("DEBUG LUT: Trying path: %s\n", test.c_str());
         std::ifstream f(test+"density_curve_r.csv");
-        if(f.good()){ base = test; break; }
+        if(f.good()){ 
+            printf("DEBUG LUT: Found data at: %s\n", test.c_str());
+            base = test; 
+            break; 
+        } else {
+            printf("DEBUG LUT: Failed to open: %s\n", (test+"density_curve_r.csv").c_str());
+        }
     }
-    if(base.empty()) return false;
+    if(base.empty()) {
+        printf("DEBUG LUT: No valid path found for stock '%s'\n", stock);
+        return false;
+    }
     
     std::vector<float> x, yr, yg, yb;
-    if(!loadCurve(base+"density_curve_r.csv", x, yr)) return false;
-    std::vector<float> xg; if(!loadCurve(base+"density_curve_g.csv", xg, yg)) return false;
-    std::vector<float> xb; if(!loadCurve(base+"density_curve_b.csv", xb, yb)) return false;
+    if(!loadCurve(base+"density_curve_r.csv", x, yr)) {
+        printf("DEBUG LUT: Failed to load red curve from %s\n", (base+"density_curve_r.csv").c_str());
+        return false;
+    }
+    std::vector<float> xg; 
+    if(!loadCurve(base+"density_curve_g.csv", xg, yg)) {
+        printf("DEBUG LUT: Failed to load green curve from %s\n", (base+"density_curve_g.csv").c_str());
+        return false;
+    }
+    std::vector<float> xb; 
+    if(!loadCurve(base+"density_curve_b.csv", xb, yb)) {
+        printf("DEBUG LUT: Failed to load blue curve from %s\n", (base+"density_curve_b.csv").c_str());
+        return false;
+    }
+
+    printf("DEBUG LUT: Successfully loaded %zu samples\n", x.size());
     
     // Copy to output arrays (assuming 601 samples)
     size_t n = std::min((size_t)601, x.size());

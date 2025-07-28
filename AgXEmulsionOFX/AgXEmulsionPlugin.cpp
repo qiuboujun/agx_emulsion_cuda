@@ -12,6 +12,7 @@
 #include <dlfcn.h>
 #include <cstring>
 #include "EmulsionKernel.cuh"
+#include "DiffusionHalationKernel.cuh"
 
 #define kPluginName "AgX Emulsion"
 #define kPluginGrouping "OpenFX JQ"
@@ -35,22 +36,38 @@ public:
     virtual void multiThreadProcessImages(OfxRectI p_ProcWindow);
 
     void setSrcImg(OFX::Image* p_SrcImg);
+    void setImages(OFX::Image* src, OFX::Image* dst) {
+        _srcImg = src; 
+        _dstImg = dst;
+    }
     // void setParams(float p_invertStrength);
     void setFrameTime(double frameTime) {_frameTime = frameTime; }
-    void setFilmGamma(const std::string& film,float gamma){_film=film;_gamma=gamma;}
-    const std::string& getFilm() const {return _film;}
+    void setFilmGamma(const char* film,float gamma){
+        strncpy(_film, film, 63); 
+        _film[63] = 0; 
+        _gamma=gamma;
+    }
+    const char* getFilm() const {return _film;}
     float getGamma() const {return _gamma;}
+
+    void setDiffusionHalation(float radius, float hal){ _radius = radius; _halStrength = hal; }
+
 private:
     OFX::Image* _srcImg;
     // float _unused;
     double _frameTime;
-    std::string _film;
+    char _film[64];
     float _gamma;
+    float _radius;
+    float _halStrength;
 };
 
 AgXEmulsionProcessor::AgXEmulsionProcessor(OFX::ImageEffect& p_Instance)
     : OFX::ImageProcessor(p_Instance)
 {
+    _film[0] = '\0';  // Initialize as empty string
+    _radius = 0.f;
+    _halStrength = 0.f;
 }
 
 extern "C" void LaunchEmulsionCUDA(float* img, int width, int height, float gamma);
@@ -60,24 +77,45 @@ void AgXEmulsionProcessor::processImagesCUDA()
     static char sFilm[64]="";
     static float sGamma=-1.0f;
     bool lutOK=true;
-    if(_film!="" && (strcmp(_film.c_str(),sFilm)!=0 || _gamma!=sGamma)){
+    
+    // Debug: Print current values
+    printf("DEBUG: _film='%s', _gamma=%f\n", _film, _gamma);
+    printf("DEBUG: sFilm='%s', sGamma=%f\n", sFilm, sGamma);
+    
+    if(_film[0]!='\0' && (strcmp(_film,sFilm)!=0 || _gamma!=sGamma)){
+        printf("DEBUG: LUT needs update\n");
         static void* helper = nullptr;
         static bool (*loadFn)(const char*,float*,float*,float*,float*) = nullptr;
         if(!helper){
             helper = dlopen("libAgXLUT.so", RTLD_LAZY);
-            if(helper) loadFn = (bool(*)(const char*,float*,float*,float*,float*))dlsym(helper,"loadFilmLUT");
+            printf("DEBUG: dlopen result = %p\n", helper);
+            if(helper) {
+                loadFn = (bool(*)(const char*,float*,float*,float*,float*))dlsym(helper,"loadFilmLUT");
+                printf("DEBUG: dlsym result = %p\n", (void*)loadFn);
+            } else {
+                printf("DEBUG: dlopen failed: %s\n", dlerror());
+            }
         }
-        if(loadFn){
+        if(loadFn && helper){
             float logE[601], r[601], g[601], b[601];
-            if(loadFn && loadFn(_film.c_str(),logE,r,g,b)){
+            bool loaded = loadFn(_film,logE,r,g,b);
+            printf("DEBUG: loadFn result = %s\n", loaded ? "SUCCESS" : "FAILED");
+            if(loaded){
                 UploadLUTCUDA(logE,r,g,b);
-                strncpy(sFilm,_film.c_str(),63); sFilm[63]=0;
+                strncpy(sFilm,_film,63); sFilm[63]=0;
                 sGamma=_gamma;
+                printf("DEBUG: LUT uploaded successfully\n");
             } else {
                 lutOK=false;
             }
+        } else {
+            lutOK=false;
+            printf("DEBUG: No helper or loadFn available\n");
         }
+    } else {
+        printf("DEBUG: Using cached LUT\n");
     }
+
     const OfxRectI& bounds = _srcImg->getBounds();
     const int width  = bounds.x2 - bounds.x1;
     const int height = bounds.y2 - bounds.y1;
@@ -92,6 +130,11 @@ void AgXEmulsionProcessor::processImagesCUDA()
     if(lutOK){
         // Launch emulsion kernel
         LaunchEmulsionCUDA(dstPtr, width, height, _gamma);
+        // Apply diffusion + halation if enabled
+        if(_radius > 0.1f || _halStrength > 1e-5f){
+            printf("DEBUG: LaunchDiffusionHalation radius=%f hal=%f\n", _radius, _halStrength);
+            LaunchDiffusionHalationCUDA(dstPtr, width, height, _radius, _halStrength);
+        }
     }
 }
 
@@ -159,6 +202,8 @@ private:
 
     OFX::ChoiceParam* m_filmStock;
     OFX::DoubleParam* m_gammaFactor;
+    OFX::DoubleParam* m_diffusionRadius;
+    OFX::DoubleParam* m_halationStrength;
 };
 
 AgXEmulsionPlugin::AgXEmulsionPlugin(OfxImageEffectHandle p_Handle)
@@ -169,6 +214,8 @@ AgXEmulsionPlugin::AgXEmulsionPlugin(OfxImageEffectHandle p_Handle)
 
     m_filmStock = fetchChoiceParam("filmStock");
     m_gammaFactor = fetchDoubleParam("gammaFactor");
+    m_diffusionRadius = fetchDoubleParam("diffusionRadius");
+    m_halationStrength = fetchDoubleParam("halationStrength");
 }
 
 void AgXEmulsionPlugin::render(const OFX::RenderArguments& p_Args)
@@ -198,38 +245,40 @@ bool AgXEmulsionPlugin::isIdentity(const OFX::IsIdentityArguments& p_Args, OFX::
 
 void AgXEmulsionPlugin::setupAndProcess(AgXEmulsionProcessor& p_AgXProcessor, const OFX::RenderArguments& p_Args)
 {
-    // Get the dst image
-    std::auto_ptr<OFX::Image> dst(m_DstClip->fetchImage(p_Args.time));
-    OFX::BitDepthEnum dstBitDepth = dst->getPixelDepth();
-    OFX::PixelComponentEnum dstComponents = dst->getPixelComponents();
+    // Get the render window and the time from the render arguments
+    const OfxTime time = p_Args.time;
+    const OfxRectI& renderWindow = p_Args.renderWindow;
 
-    // Get the src image
-    std::auto_ptr<OFX::Image> src(m_SrcClip->fetchImage(p_Args.time));
-    OFX::BitDepthEnum srcBitDepth = src->getPixelDepth();
-    OFX::PixelComponentEnum srcComponents = src->getPixelComponents();
+    // Retrieve any instance data associated with this effect
+    OFX::Image* src = m_SrcClip->fetchImage(time);
+    OFX::Image* dst = m_DstClip->fetchImage(time);
 
-    // Check to see if the bit depth and number of components are the same
-    if ((srcBitDepth != dstBitDepth) || (srcComponents != dstComponents))
-    {
-        OFX::throwSuiteStatusException(kOfxStatErrValue);
-    }
+    // Set images and other arguments
+    p_AgXProcessor.setImages(src, dst);
 
-    int filmIdx; m_filmStock->getValueAtTime(p_Args.time, filmIdx);
-    std::string filmName = filmIdx==0?"kodak_portra_400":"kodak_vision3_250d";
-    double gamma = m_gammaFactor->getValueAtTime(p_Args.time);
+    // Get parameter values
+    int filmIdx; 
+    m_filmStock->getValueAtTime(p_Args.time, filmIdx);
+    printf("DEBUG: Film index from param = %d\n", filmIdx);
     
-    // Set the images
-    p_AgXProcessor.setDstImg(dst.get());
-    p_AgXProcessor.setSrcImg(src.get());
-  
+    const char* filmName = filmIdx==0?"kodak_portra_400":"kodak_vision3_250d";
+    printf("DEBUG: Film name = %s\n", filmName);
+    
+    double gamma = m_gammaFactor->getValueAtTime(p_Args.time);
+    printf("DEBUG: Gamma from param = %f\n", gamma);
+
+    double radius = m_diffusionRadius->getValueAtTime(p_Args.time);
+    double hal   = m_halationStrength->getValueAtTime(p_Args.time);
+    printf("DEBUG: Radius from param = %f, Halation = %f\n", radius, hal);
+ 
+    p_AgXProcessor.setFilmGamma(filmName,(float)gamma);
+    p_AgXProcessor.setDiffusionHalation((float)radius,(float)hal);
+
     // Setup OpenCL and CUDA Render arguments
     p_AgXProcessor.setGPURenderArgs(p_Args);
 
     // Set the render window
     p_AgXProcessor.setRenderWindow(p_Args.renderWindow);
-
-    // Set the parameters
-    p_AgXProcessor.setFilmGamma(filmName,(float)gamma);
 
     // Call the base class process member, this will call the derived templated process code
     p_AgXProcessor.process();
@@ -310,6 +359,26 @@ void AgXEmulsionPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_D
     gparam->setIncrement(0.01);
     gparam->setDisplayRange(0.5,2.0);
     page->addChild(*gparam);
+
+    // Diffusion radius
+    DoubleParamDescriptor* dparam = p_Desc.defineDoubleParam("diffusionRadius");
+    dparam->setLabel("Diffusion Radius");
+    dparam->setHint("Gaussian diffusion radius in pixels");
+    dparam->setDefault(3.0);
+    dparam->setRange(0.0,25.0);
+    dparam->setIncrement(0.1);
+    dparam->setDisplayRange(0.0,25.0);
+    page->addChild(*dparam);
+
+    // Halation strength
+    DoubleParamDescriptor* hparam = p_Desc.defineDoubleParam("halationStrength");
+    hparam->setLabel("Halation Strength");
+    hparam->setHint("Amount of red halation to add");
+    hparam->setDefault(0.2);
+    hparam->setRange(0.0,1.0);
+    hparam->setIncrement(0.01);
+    hparam->setDisplayRange(0.0,1.0);
+    page->addChild(*hparam);
 }
 
 ImageEffect* AgXEmulsionPluginFactory::createInstance(OfxImageEffectHandle p_Handle, ContextEnum /*p_Context*/)
