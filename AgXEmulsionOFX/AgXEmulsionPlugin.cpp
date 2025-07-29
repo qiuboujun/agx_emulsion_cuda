@@ -23,11 +23,16 @@
 #include "CIE1931.cuh"
 #include "couplers.hpp" // NEW include for DIR matrix computation
 #include <cstdint>
+#include <algorithm>
 #include <sys/stat.h> // Required for stat()
 #include <cmath> // Required for std::isnan
 #include <limits> // Required for std::numeric_limits
 #include <nlohmann/json.hpp>
 using json = nlohmann::json;
+
+// Global storage for camera sensitivity curves (needed for spectral LUT pre-multiplication)
+static std::vector<float> g_sensR81(81), g_sensG81(81), g_sensB81(81);
+static bool g_sensitivityLoaded = false;
 
 // Forward CUDA uploads for spectral stage
 extern "C" bool UploadCameraSensCUDA(const float* sensR,const float* sensG,const float* sensB,int count);
@@ -190,6 +195,15 @@ bool loadFilteredFilmLUT(const char* stock_name, float* logE, float* r, float* g
                 sensG81[i]=powf(10.0f, lg);
                 sensB81[i]=powf(10.0f, lb);
             }
+            
+            // Store globally for spectral LUT pre-multiplication
+            g_sensR81 = sensR81;
+            g_sensG81 = sensG81;
+            g_sensB81 = sensB81;
+            g_sensitivityLoaded = true;
+            
+            printf("DEBUG: Stored sensitivity curves globally for spectral LUT pre-multiplication\n");
+            
             UploadCameraSensCUDA(sensR81.data(), sensG81.data(), sensB81.data(), 81);
         }
         return true;
@@ -456,11 +470,11 @@ bool loadSpectralLUTFromCSV(const char* csv_path, float* spectral_lut, int* widt
                             while (std::getline(meta_file, meta_line)) {
                                 try {
                                     if (meta_line.find("original_shape_x=") == 0) {
-                                        *width = std::stoi(meta_line.substr(16));
+                                        *width = std::stoi(meta_line.substr(17)); // "original_shape_x=" = 17 chars
                                     } else if (meta_line.find("original_shape_y=") == 0) {
-                                        *height = std::stoi(meta_line.substr(16));
+                                        *height = std::stoi(meta_line.substr(17)); // "original_shape_y=" = 17 chars
                                     } else if (meta_line.find("spectral_samples=") == 0) {
-                                        *spectral_samples = std::stoi(meta_line.substr(17));
+                                        *spectral_samples = std::stoi(meta_line.substr(17)); // "spectral_samples=" = 17 chars
                                     }
                                 } catch (const std::exception& e) {
                                     printf("DEBUG: Failed to parse metadata line '%s': %s\n", meta_line.c_str(), e.what());
@@ -500,6 +514,76 @@ bool loadSpectralLUTFromCSV(const char* csv_path, float* spectral_lut, int* widt
         printf("DEBUG: Spectral LUT CSV parsing error: %s\n", e.what());
         return false;
     }
+}
+
+bool loadAndPreMultiplySpectralLUT(const char* csv_path, const std::vector<float>& sensR, 
+                                   const std::vector<float>& sensG, const std::vector<float>& sensB,
+                                   float* output_lut, int* width, int* height) {
+    // First load the raw spectral LUT
+    int spectral_samples;
+    float* raw_spectral_lut = new float[36864 * 81]; // 192*192 * 81 spectral samples
+    
+    bool loaded = loadSpectralLUTFromCSV(csv_path, raw_spectral_lut, width, height, &spectral_samples);
+    if (!loaded) {
+        delete[] raw_spectral_lut;
+        return false;
+    }
+    
+    printf("DEBUG: Pre-multiplying spectral LUT with sensitivity curves\n");
+    printf("DEBUG: Sensitivity R[0]=%.6f, G[0]=%.6f, B[0]=%.6f\n", sensR[0], sensG[0], sensB[0]);
+    printf("DEBUG: Sensitivity R[40]=%.6f, G[40]=%.6f, B[40]=%.6f\n", sensR[40], sensG[40], sensB[40]);
+    printf("DEBUG: Sensitivity R[80]=%.6f, G[80]=%.6f, B[80]=%.6f\n", sensR[80], sensG[80], sensB[80]);
+    
+    // Normalize sensitivity curves to peak=1 (like Python does)
+    float max_sens_r = 0.0f, max_sens_g = 0.0f, max_sens_b = 0.0f;
+    for (int s = 0; s < 81; s++) {
+        max_sens_r = std::max(max_sens_r, sensR[s]);
+        max_sens_g = std::max(max_sens_g, sensG[s]);
+        max_sens_b = std::max(max_sens_b, sensB[s]);
+    }
+    
+    printf("DEBUG: Max sensitivity values: R=%.6f, G=%.6f, B=%.6f\n", max_sens_r, max_sens_g, max_sens_b);
+    
+    // Normalize to peak=1
+    std::vector<float> norm_sensR(81), norm_sensG(81), norm_sensB(81);
+    for (int s = 0; s < 81; s++) {
+        norm_sensR[s] = (max_sens_r > 0.0f) ? sensR[s] / max_sens_r : 0.0f;
+        norm_sensG[s] = (max_sens_g > 0.0f) ? sensG[s] / max_sens_g : 0.0f;
+        norm_sensB[s] = (max_sens_b > 0.0f) ? sensB[s] / max_sens_b : 0.0f;
+    }
+    
+    printf("DEBUG: Normalized sensitivity R[40]=%.6f, G[40]=%.6f, B[40]=%.6f\n", norm_sensR[40], norm_sensG[40], norm_sensB[40]);
+    
+    // Pre-multiply with normalized sensitivity curves (Python: tc_lut = contract('ijl,lm->ijm', HANATOS2025_SPECTRA_LUT, sensitivity))
+    // Raw layout: [coordinate][spectral_sample]
+    // Output layout: [coordinate][RGB_channel]
+    int total_coordinates = (*width) * (*height);
+    
+    for (int coord = 0; coord < total_coordinates; coord++) {
+        // Calculate raw RGB for this coordinate by dot product with sensitivity
+        float raw_r = 0.0f, raw_g = 0.0f, raw_b = 0.0f;
+        
+        for (int s = 0; s < spectral_samples && s < 81; s++) {
+            float spectrum_val = raw_spectral_lut[coord * spectral_samples + s];
+            raw_r += spectrum_val * norm_sensR[s];
+            raw_g += spectrum_val * norm_sensG[s];
+            raw_b += spectrum_val * norm_sensB[s];
+        }
+        
+        // Store pre-multiplied values: [coordinate][RGB_channel]
+        output_lut[coord * 3 + 0] = raw_r;
+        output_lut[coord * 3 + 1] = raw_g;
+        output_lut[coord * 3 + 2] = raw_b;
+    }
+    
+    printf("DEBUG: Pre-multiplication complete. LUT now contains raw RGB values.\n");
+    printf("DEBUG: First coordinate raw RGB = [%.6f, %.6f, %.6f]\n", 
+           output_lut[0], output_lut[1], output_lut[2]);
+    printf("DEBUG: Mid coordinate raw RGB = [%.6f, %.6f, %.6f]\n", 
+           output_lut[total_coordinates*3/2], output_lut[total_coordinates*3/2+1], output_lut[total_coordinates*3/2+2]);
+    
+    delete[] raw_spectral_lut;
+    return true;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -651,10 +735,15 @@ void AgXEmulsionProcessor::processImagesCUDA()
     } else {
         printf("DEBUG: Using cached LUT\n");
     }
-    // Load print LUT if paper selected
+    // Load print LUT
     static char sPaper[64]="";
+    static bool sPaperValid = false; // remembers if current cached paper was successfully loaded
+    printf("DEBUG_PAPER: _paper='%s' sPaper='%s' sPaperValid=%d\n", _paper, sPaper, sPaperValid);
     bool paperOK = false;
-    if(_paper[0]!='\0' && strcmp(_paper,sPaper)!=0){
+    if(_paper[0]=='\0'){
+        // No paper selected
+        paperOK = false;
+    } else if(strcmp(_paper,sPaper)!=0 || !sPaperValid){
         printf("DEBUG: Loading paper profile: %s\n", _paper);
         
         float printLogE[601],printR[601],printG[601],printB[601];
@@ -749,10 +838,15 @@ void AgXEmulsionProcessor::processImagesCUDA()
             printf("DEBUG: Paper parameters uploaded\n");
             
             paperOK = true;
+            sPaperValid = true;
             strncpy(sPaper,_paper,63); sPaper[63]=0;
         } else {
             printf("DEBUG: Failed to load paper profile: %s\n", _paper);
+            sPaperValid = false;
         }
+    } else {
+        // Cached profile should still be valid
+        paperOK = sPaperValid;
     }
 
     static bool spectralLUTLoaded = false;
@@ -777,23 +871,29 @@ void AgXEmulsionProcessor::processImagesCUDA()
     if(!spectralLUTLoaded || spectralNeedReload){
         printf("DEBUG: Attempting to load Spectral LUT from %s\n", spectralLUTPath);
         
-        // Load spectral LUT from CSV
-        int width, height, spectral_samples;
-        float* spectral_lut = new float[36864 * 81]; // 192*192 * 81 spectral samples
-        
-        bool loaded = loadSpectralLUTFromCSV(spectralLUTPath, spectral_lut, &width, &height, &spectral_samples);
-        
-        if(loaded) {
-            printf("DEBUG: Spectral LUT loaded from CSV successfully\n");
-            UploadSpectralLUTCUDA(spectral_lut,width,height,spectral_samples);
-            spectralLUTLoaded=true;
+        if(!g_sensitivityLoaded) {
+            printf("ERROR: Cannot load spectral LUT - sensitivity curves not loaded yet!\n");
+            printf("ERROR: Make sure film profile is loaded before spectral LUT\n");
         } else {
-            printf("ERROR: Failed to load spectral LUT from CSV, using fallback\n");
-            // For now, we'll use hardcoded values that match Python reference
-            spectralLUTLoaded = true;
+            // Load and pre-multiply spectral LUT with sensitivity (matches Python exactly)
+            int width, height;
+            float* pre_multiplied_lut = new float[36864 * 3]; // 192*192 * 3 RGB channels
+            
+            bool loaded = loadAndPreMultiplySpectralLUT(spectralLUTPath, g_sensR81, g_sensG81, g_sensB81,
+                                                        pre_multiplied_lut, &width, &height);
+            
+            if(loaded) {
+                printf("DEBUG: Pre-multiplied spectral LUT loaded successfully\n");
+                printf("DEBUG: Uploading pre-multiplied LUT to CUDA (size: %dx%d, 3 RGB channels)\n", width, height);
+                UploadSpectralLUTCUDA(pre_multiplied_lut, width, height, 3); // 3 channels: R,G,B (not 81 spectral)
+                spectralLUTLoaded=true;
+            } else {
+                printf("ERROR: Failed to load and pre-multiply spectral LUT\n");
+                spectralLUTLoaded = true;
+            }
+            
+            delete[] pre_multiplied_lut;
         }
-        
-        delete[] spectral_lut;
     }
 
     const OfxRectI& bounds = _srcImg->getBounds();
@@ -815,11 +915,15 @@ void AgXEmulsionProcessor::processImagesCUDA()
         printf("DEBUG: Spectral LUT texture valid = %s\n", textureValid ? "true" : "false");
         if(textureValid) {
             LaunchDynamicSpectralUpsamplingCUDA(devImg,width,height);
+            cudaError_t kernelErr = cudaGetLastError();
+            if(kernelErr != cudaSuccess) {
+                printf("ERROR: DynamicSpectralUpsampling kernel failed: %s\n", cudaGetErrorString(kernelErr));
+            }
             // Debug: sample center after Spectral LUT
             {
                 size_t center = (size_t)(height/2) * width + width/2;
                 float sample[4];
-                cudaMemcpy(sample, devImg + center*4, 3*sizeof(float), cudaMemcpyDeviceToHost);
+                cudaMemcpy(sample, devImg + center*4, 4*sizeof(float), cudaMemcpyDeviceToHost);
                 printf("DEBUG: After Spectral LUT center(CMY) = %f,%f,%f\n", sample[0], sample[1], sample[2]);
             }
         } else {
