@@ -41,69 +41,39 @@ void compute_density_curves_before_dir_couplers(const std::vector<std::array<dou
                                                 const Matrix3& dir_couplers_matrix,
                                                 double high_exposure_couplers_shift,
                                                 std::vector<std::array<double,3>>& out){
-    size_t n=log_exposure.size();
+    size_t n = log_exposure.size();
     out.resize(n);
 
-    // compute d_max per channel
-    std::array<double,3> dmax={0,0,0};
-    for(const auto& row: density_curves){
-        for(int c=0;c<3;c++) dmax[c]=std::max(dmax[c],row[c]);
+    // compute max density per channel
+    std::array<double,3> dmax{0,0,0};
+    for(const auto& row: density_curves)
+        for(int c=0;c<3;c++)
+            dmax[c] = std::max(dmax[c], row[c]);
+
+    // build shifted x0 arrays and original y arrays
+    dvec x0_R(n), x0_G(n), x0_B(n);
+    dvec yR(n), yG(n), yB(n);
+    for(size_t i=0;i<n;i++){
+        std::array<double,3> norm_shift;
+        for(int c=0;c<3;c++){
+            double v = density_curves[i][c] / dmax[c];
+            v += high_exposure_couplers_shift * v * v;
+            norm_shift[c] = v;
+        }
+        std::array<double,3> cou_amt{0,0,0};
+        for(int j=0;j<3;j++) for(int k=0;k<3;k++)
+            cou_amt[j] += norm_shift[k] * dir_couplers_matrix[k][j];
+        double le = log_exposure[i];
+        x0_R[i] = le - cou_amt[0]; x0_G[i] = le - cou_amt[1]; x0_B[i] = le - cou_amt[2];
+        yR[i] = density_curves[i][0]; yG[i] = density_curves[i][1]; yB[i] = density_curves[i][2];
     }
 
-    // for each row, compute dc_norm_shift and couplers_amount
+    // interpolate corrected density curves
     for(size_t i=0;i<n;i++){
-        std::array<double,3> norm_shift;
-        for(int c=0;c<3;c++){
-            double v=density_curves[i][c]/dmax[c];
-            v+=high_exposure_couplers_shift*v*v;
-            norm_shift[c]=v;
-        }
-        std::array<double,3> couplers_amount={0,0,0};
-        // matrix multiply row vector (norm_shift) with dir_couplers_matrix
-        for(int j=0;j<3;j++){
-            double sum=0.0;
-            for(int k=0;k<3;k++) sum+=norm_shift[k]*dir_couplers_matrix[k][j];
-            couplers_amount[j]=sum;
-        }
-        // compute x0 = log_exposure[i] - couplers_amount[channel]
-        for(int c=0;c<3;c++){
-            double target_x = log_exposure[i];
-            double shifted_x = target_x - couplers_amount[c];
-            // interpolate density_curves[:,c] at x=shifted_x
-            // We need x-vector (log_exposure) and y-vector for channel
-            // gather channel column y vector once ( ineff ) but fine for n small
-        }
-    }
-    // Precompute channel x0 arrays
-    dvec x0_R(n), x0_G(n), x0_B(n);
-    dvec yR(n),yG(n),yB(n);
-    for(size_t i=0;i<n;i++){
-        // recompute norm_shift and couplers amount
-        std::array<double,3> norm_shift;
-        for(int c=0;c<3;c++){
-            double v=density_curves[i][c]/dmax[c];
-            v+=high_exposure_couplers_shift*v*v;
-            norm_shift[c]=v;
-        }
-        std::array<double,3> couplers_amount;
-        for(int j=0;j<3;j++){
-            double sum=0.0;for(int k=0;k<3;k++) sum+=norm_shift[k]*dir_couplers_matrix[k][j];
-            couplers_amount[j]=sum;
-        }
-        double le=log_exposure[i];
-        x0_R[i]=le - couplers_amount[0];
-        x0_G[i]=le - couplers_amount[1];
-        x0_B[i]=le - couplers_amount[2];
-        yR[i]=density_curves[i][0];
-        yG[i]=density_curves[i][1];
-        yB[i]=density_curves[i][2];
-    }
-    // Now perform interpolation for each target le
-    for(size_t i=0;i<n;i++){
-        double le=log_exposure[i];
-        out[i][0]=interp_linear(x0_R,yR, le);
-        out[i][1]=interp_linear(x0_G,yG, le);
-        out[i][2]=interp_linear(x0_B,yB, le);
+        double le = log_exposure[i];
+        out[i][0] = interp_linear(x0_R, yR, le);
+        out[i][1] = interp_linear(x0_G, yG, le);
+        out[i][2] = interp_linear(x0_B, yB, le);
     }
 }
 

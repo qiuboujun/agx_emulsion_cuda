@@ -3,6 +3,9 @@
 #include <stdio.h>
 #include <random>
 #include <iostream>
+#include <fstream>
+#include <sstream>
+#include <vector>
 
 #include "ofxsImageEffect.h"
 #include "ofxsMultiThread.h"
@@ -18,6 +21,10 @@
 #include "DirCouplerKernel.cuh"
 #include "CIE1931.cuh"
 #include "couplers.hpp" // NEW include for DIR matrix computation
+#include <cstdint>
+#include <sys/stat.h> // Required for stat()
+#include <cmath> // Required for std::isnan
+#include <limits> // Required for std::numeric_limits
 
 #define kPluginName "AgX Emulsion"
 #define kPluginGrouping "OpenFX JQ"
@@ -29,6 +36,149 @@
 #define kSupportsTiles false
 #define kSupportsMultiResolution false
 #define kSupportsMultipleClipPARs false
+
+// Function to load JSON profile and handle nan values (same as test)
+bool loadFilteredFilmLUT(const char* stock_name, float* logE, float* r, float* g, float* b) {
+    std::string json_path = "/usr/OFX/Plugins/data/profiles/" + std::string(stock_name) + ".json";
+    std::ifstream file(json_path);
+    
+    if (!file.is_open()) {
+        printf("DEBUG: Could not open JSON profile: %s\n", json_path.c_str());
+        return false;
+    }
+    
+    // Simple JSON parsing for the density curves
+    std::string line;
+    bool in_density_curves = false;
+    bool in_log_exposure = false;
+    std::vector<float> temp_log_exposure;
+    std::vector<float> temp_density_r, temp_density_g, temp_density_b;
+    
+    while (std::getline(file, line)) {
+        if (line.find("\"density_curves\"") != std::string::npos) {
+            in_density_curves = true;
+            continue;
+        }
+        if (line.find("\"log_exposure\"") != std::string::npos) {
+            in_log_exposure = true;
+            continue;
+        }
+        
+        if (in_log_exposure) {
+            if (line.find("]") != std::string::npos) {
+                in_log_exposure = false;
+                continue;
+            }
+            
+            // Parse log_exposure values
+            std::istringstream iss(line);
+            std::string token;
+            while (iss >> token) {
+                if (token.find(",") != std::string::npos) {
+                    token = token.substr(0, token.find(","));
+                }
+                if (token.find("[") != std::string::npos) {
+                    token = token.substr(token.find("[") + 1);
+                }
+                if (token.find("]") != std::string::npos) {
+                    token = token.substr(0, token.find("]"));
+                }
+                
+                if (!token.empty() && token != "[" && token != "]") {
+                    try {
+                        float val = std::stof(token);
+                        temp_log_exposure.push_back(val);
+                    } catch (...) {
+                        // Skip non-numeric values
+                    }
+                }
+            }
+        }
+        
+        if (in_density_curves) {
+            if (line.find("]") != std::string::npos) {
+                in_density_curves = false;
+                continue;
+            }
+            
+            // Parse density curve values (3 channels per line)
+            std::istringstream iss(line);
+            std::string token;
+            std::vector<float> row_values;
+            
+            while (iss >> token) {
+                if (token.find(",") != std::string::npos) {
+                    token = token.substr(0, token.find(","));
+                }
+                if (token.find("[") != std::string::npos) {
+                    token = token.substr(token.find("[") + 1);
+                }
+                if (token.find("]") != std::string::npos) {
+                    token = token.substr(0, token.find("]"));
+                }
+                
+                if (!token.empty() && token != "[" && token != "]") {
+                    try {
+                        if (token == "null" || token == "nan") {
+                            row_values.push_back(std::numeric_limits<float>::quiet_NaN());
+                        } else {
+                            float val = std::stof(token);
+                            row_values.push_back(val);
+                        }
+                    } catch (...) {
+                        row_values.push_back(std::numeric_limits<float>::quiet_NaN());
+                    }
+                }
+            }
+            
+            if (row_values.size() >= 3) {
+                temp_density_r.push_back(row_values[0]);
+                temp_density_g.push_back(row_values[1]);
+                temp_density_b.push_back(row_values[2]);
+            }
+        }
+    }
+    
+    // Filter out nan values (same as Python implementation)
+    std::vector<float> log_exposure, density_r, density_g, density_b;
+    for (size_t i = 0; i < temp_log_exposure.size(); i++) {
+        if (i < temp_density_r.size() && 
+            !std::isnan(temp_density_r[i]) && 
+            !std::isnan(temp_density_g[i]) && 
+            !std::isnan(temp_density_b[i])) {
+            
+            log_exposure.push_back(temp_log_exposure[i]);
+            density_r.push_back(temp_density_r[i]);
+            density_g.push_back(temp_density_g[i]);
+            density_b.push_back(temp_density_b[i]);
+        }
+    }
+    
+    if (log_exposure.empty()) {
+        printf("DEBUG: No valid data found in JSON profile after filtering\n");
+        return false;
+    }
+    
+    // Copy data to output arrays (limit to 601 samples)
+    int count = std::min((int)log_exposure.size(), 601);
+    for (int i = 0; i < count; i++) {
+        logE[i] = log_exposure[i];
+        r[i] = density_r[i];
+        g[i] = density_g[i];
+        b[i] = density_b[i];
+    }
+    
+    // Pad with last value if needed
+    for (int i = count; i < 601; i++) {
+        logE[i] = logE[count-1];
+        r[i] = r[count-1];
+        g[i] = g[count-1];
+        b[i] = b[count-1];
+    }
+    
+    printf("DEBUG: Loaded JSON profile: %d valid samples (filtered from %zu total)\n", count, temp_log_exposure.size());
+    return true;
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -60,6 +210,7 @@ public:
     void setExposure(float ev){ _exposureEV = ev; }
     void setPrintPaper(const char* paper){ strncpy(_paper,paper,63); _paper[63]=0; }
     void setDirParams(float amount,float interlayer,float diffUm,float highShift,float pxSize){ _dirAmount=amount; _dirInterlayer=interlayer; _dirDiffUm=diffUm; _dirHighShift=highShift; _pxSize=pxSize; }
+    void setPrintParams(bool rm,float exp,float pf){ _removeGlareFlag=rm; _printExposure=exp; _preflash=pf; }
 
 private:
     OFX::Image* _srcImg;
@@ -79,6 +230,9 @@ private:
     float _dirDiffUm{10.f};
     float _dirHighShift{0.f};
     float _pxSize{5.f};
+    bool  _removeGlareFlag{true};
+    float _printExposure{1.f};
+    float _preflash{0.f};
 };
 
 AgXEmulsionProcessor::AgXEmulsionProcessor(OFX::ImageEffect& p_Instance)
@@ -95,6 +249,10 @@ AgXEmulsionProcessor::AgXEmulsionProcessor(OFX::ImageEffect& p_Instance)
 }
 
 extern "C" void LaunchEmulsionCUDA(float* img, int width, int height, float gamma, float exposureEV);
+extern "C" void UploadExposureLUTCUDA(const uint16_t* lut,int sizeX,int sizeY);
+extern "C" void UploadCameraMatrixCUDA(const float* m33);
+extern "C" void LaunchCameraLUTCUDA(float* img,int width,int height);
+extern "C" bool IsCameraLUTValid();
 
 void AgXEmulsionProcessor::processImagesCUDA()
 {
@@ -108,52 +266,63 @@ void AgXEmulsionProcessor::processImagesCUDA()
     
     if(_film[0]!='\0' && (strcmp(_film,sFilm)!=0 || _gamma!=sGamma)){
         printf("DEBUG: LUT needs update\n");
-        static void* helper = nullptr;
-        static bool (*loadFn)(const char*,float*,float*,float*,float*) = nullptr;
-        if(!helper){
-            helper = dlopen("libAgXLUT.so", RTLD_LAZY);
-            printf("DEBUG: dlopen result = %p\n", helper);
-            if(helper) {
-                loadFn = (bool(*)(const char*,float*,float*,float*,float*))dlsym(helper,"loadFilmLUT");
-                printf("DEBUG: dlsym result = %p\n", (void*)loadFn);
-            } else {
-                printf("DEBUG: dlopen failed: %s\n", dlerror());
+        
+        // Try to load JSON profile with nan filtering first
+        float logE[601], r[601], g[601], b[601];
+        bool loaded = loadFilteredFilmLUT(_film, logE, r, g, b);
+        
+        if (!loaded) {
+            // Fallback to original dynamic library approach
+            printf("DEBUG: JSON profile not found, trying dynamic library\n");
+            static void* helper = nullptr;
+            static bool (*loadFn)(const char*,float*,float*,float*,float*) = nullptr;
+            if(!helper){
+                helper = dlopen("libAgXLUT.so", RTLD_LAZY);
+                printf("DEBUG: dlopen result = %p\n", helper);
+                if(helper) {
+                    loadFn = (bool(*)(const char*,float*,float*,float*,float*))dlsym(helper,"loadFilmLUT");
+                    printf("DEBUG: dlsym result = %p\n", (void*)loadFn);
+                } else {
+                    printf("DEBUG: dlopen failed: %s\n", dlerror());
+                }
             }
-        }
-        if(loadFn && helper){
-            float logE[601], r[601], g[601], b[601];
-            bool loaded = loadFn(_film,logE,r,g,b);
-            printf("DEBUG: loadFn result = %s\n", loaded ? "SUCCESS" : "FAILED");
-            if(loaded){
-                UploadLUTCUDA(logE,r,g,b);
-                // === DIR Coupler: compute and upload matrix & params ===
-                // Compute density max per channel from film LUT
-                float dMax[3]={0.f,0.f,0.f};
-                for(int i=0;i<601;i++){dMax[0]=fmaxf(dMax[0],r[i]);dMax[1]=fmaxf(dMax[1],g[i]);dMax[2]=fmaxf(dMax[2],b[i]);}
-                // Build DIR matrix using CPU helper (double precision)
-                std::array<double,3> amtRGB = { (double)_dirAmount, (double)_dirAmount, (double)_dirAmount };
-                cp::Matrix3 M = cp::compute_dir_couplers_matrix(amtRGB,(double)_dirInterlayer);
-                float Mf[9];
-                for(int row=0;row<3;row++) for(int col=0;col<3;col++) Mf[row*3+col] = (float)M[row][col];
-                UploadDirMatrixCUDA(Mf);
-                // Sigma in pixels
-                float sigmaPx = (_pxSize>1e-6f)? (_dirDiffUm/_pxSize) : 0.f;
-                UploadDirParamsCUDA(dMax,_dirHighShift,sigmaPx);
-                strncpy(sFilm,_film,63); sFilm[63]=0;
-                sGamma=_gamma;
-                printf("DEBUG: LUT & DIR uploaded successfully (dMax=%f,%f,%f sigmaPx=%f)\n",dMax[0],dMax[1],dMax[2],sigmaPx);
+            if(loadFn && helper){
+                loaded = loadFn(_film,logE,r,g,b);
+                printf("DEBUG: loadFn result = %s\n", loaded ? "SUCCESS" : "FAILED");
             } else {
-                lutOK=false;
+                printf("DEBUG: No helper or loadFn available\n");
             }
         } else {
+            printf("DEBUG: JSON profile loaded successfully\n");
+        }
+        
+        if(loaded){
+            UploadLUTCUDA(logE,r,g,b);
+            // === DIR Coupler: compute and upload matrix & params ===
+            // Compute density max per channel from film LUT
+            float dMax[3]={0.f,0.f,0.f};
+            for(int i=0;i<601;i++){dMax[0]=fmaxf(dMax[0],r[i]);dMax[1]=fmaxf(dMax[1],g[i]);dMax[2]=fmaxf(dMax[2],b[i]);}
+            // Build DIR matrix using CPU helper (double precision)
+            std::array<double,3> amtRGB = { (double)_dirAmount, (double)_dirAmount, (double)_dirAmount };
+            cp::Matrix3 M = cp::compute_dir_couplers_matrix(amtRGB,(double)_dirInterlayer);
+            float Mf[9];
+            for(int row=0;row<3;row++) for(int col=0;col<3;col++) Mf[row*3+col] = (float)M[row][col];
+            UploadDirMatrixCUDA(Mf);
+            // Sigma in pixels
+            float sigmaPx = (_pxSize>1e-6f)? (_dirDiffUm/_pxSize) : 0.f;
+            UploadDirParamsCUDA(dMax,_dirHighShift,sigmaPx);
+            strncpy(sFilm,_film,63); sFilm[63]=0;
+            sGamma=_gamma;
+            printf("DEBUG: LUT & DIR uploaded successfully (dMax=%f,%f,%f sigmaPx=%f)\n",dMax[0],dMax[1],dMax[2],sigmaPx);
+        } else {
             lutOK=false;
-            printf("DEBUG: No helper or loadFn available\n");
         }
     } else {
         printf("DEBUG: Using cached LUT\n");
     }
     // Load print LUT if paper selected
     static char sPaper[64]="";
+    bool paperOK = false;
     if(_paper[0]!='\0' && strcmp(_paper,sPaper)!=0){
         static void* helperP=nullptr; 
         static bool (*loadPrint)(const char*,float*,float*,float*,float*,char*)=nullptr;
@@ -169,6 +338,60 @@ void AgXEmulsionProcessor::processImagesCUDA()
             float printLogE[601],printR[601],printG[601],printB[601];
             char illuminant[16] = "D50";  // Default
             if(loadPrint(_paper,printLogE,printR,printG,printB,illuminant)){
+                if(_removeGlareFlag){
+                    auto applyGlare=[&](float* curve){
+                        const int N=601; const float factor=0.2f; const float density=1.0f; const float transition=0.3f;
+                        // compute mean curve
+                        float mean[N]; for(int i=0;i<N;i++) mean[i]=(printR[i]+printG[i]+printB[i])*0.333333f;
+                        // find le_center by interpolating mean curve at target density
+                        // linear search
+                        int idx=0; while(idx<N-1 && mean[idx]<density) idx++;
+                        float le_center;
+                        if(idx==0) le_center=printLogE[0];
+                        else{
+                            float t=(density-mean[idx-1])/(mean[idx]-mean[idx-1]+1e-6f);
+                            le_center=printLogE[idx-1]*(1-t)+printLogE[idx]*t;
+                        }
+                        // slope measurement +-1 EV (log2 -> log10 factor)
+                        float le_delta=0.30103f; // log10(2)/2 approx 0.1505? Wait in python they used log10(2**range_ev)/2 ; range=1 so delta=0.1505
+                        le_delta=0.150515f;
+                        float le0=le_center-le_delta, le1=le_center+le_delta;
+                        auto interp=[&](float target)->float{
+                            int j=0; while(j<N-1 && printLogE[j]<target) j++;
+                            if(j==0) return curve[0]; if(j>=N-1) return curve[N-1];
+                            float t=(target-printLogE[j-1])/(printLogE[j]-printLogE[j-1]+1e-6f);
+                            return curve[j-1]*(1-t)+curve[j]*t; };
+                        float density0=interp(le0);
+                        float density1=interp(le1);
+                        float slope=(density1-density0)/(le1-le0+1e-6f);
+                        // create shifted le array
+                        std::vector<float> le_nl(N);
+                        for(int i=0;i<N;i++){
+                            le_nl[i]=printLogE[i];
+                            if(printLogE[i]>le_center) le_nl[i]-=(printLogE[i]-le_center)*factor;
+                        }
+                        // gaussian blur le_nl with sigma = (transition/slope)/le_step
+                        float le_step=(printLogE[N-1]-printLogE[0])/(N-1);
+                        float sigma=(transition/slope)/(le_step+1e-6f);
+                        int rad=(int)(sigma*3); if(rad<1) rad=1; if(rad>50) rad=50;
+                        std::vector<float> kernel(2*rad+1);
+                        float sum=0.f; for(int k=-rad;k<=rad;k++){float w=expf(-0.5f*k*k/(sigma*sigma)); kernel[k+rad]=w; sum+=w;}
+                        for(auto& w:kernel) w/=sum;
+                        std::vector<float> tmp(N);
+                        for(int i=0;i<N;i++){
+                            float acc=0.f; for(int k=-rad;k<=rad;k++){int j=i+k; if(j<0) j=0; if(j>=N) j=N-1; acc+=le_nl[j]*kernel[k+rad];}
+                            tmp[i]=acc; }
+                        le_nl.swap(tmp);
+                        // remap curve via interpolation
+                        std::vector<float> outCurve(N);
+                        for(int i=0;i<N;i++) outCurve[i]=interp(le_nl[i]);
+                        for(int i=0;i<N;i++) curve[i]=outCurve[i];
+                    };
+                    applyGlare(printR);
+                    applyGlare(printG);
+                    applyGlare(printB);
+                }
+                // now upload curves
                 UploadPaperLUTCUDA(printLogE,printR,printG,printB);
                 printf("DEBUG: Paper LUT uploaded, illuminant='%s'\n", illuminant);
                 
@@ -210,11 +433,58 @@ void AgXEmulsionProcessor::processImagesCUDA()
                 if(loadSpec && loadSpec(_paper,cSpec,mSpec,ySpec,dmin,&nSpec)){
                     UploadPaperSpectraCUDA(cSpec,mSpec,ySpec,dmin,nSpec);
                     printf("DEBUG: Spectra uploaded N=%d\n",nSpec);
+                    UploadPaperParamsCUDA(_printExposure,_preflash);
+                    paperOK = true;
                 } else {printf("DEBUG: Spectra load fail\n");}
-                lutOK=true;
                 strncpy(sPaper,_paper,63); sPaper[63]=0;
             } else {printf("DEBUG: Paper LUT load fail\n");}
         }
+    }
+
+    static bool lutCamLoaded=false;
+    static time_t lastModTime=0;
+    printf("DEBUG: lutCamLoaded = %s\n", lutCamLoaded ? "true" : "false");
+    
+    // Check if we need to reload the LUT file
+    struct stat st;
+    const char* lutPath = "/usr/OFX/Plugins/AgXEmulsionPlugin.ofx.bundle/Contents/Linux-x86-64/data/exposure_lut.bin";
+    bool needReload = false;
+    
+    if(stat(lutPath, &st) == 0) {
+        if(!lutCamLoaded || st.st_mtime > lastModTime) {
+            needReload = true;
+            lastModTime = st.st_mtime;
+            printf("DEBUG: LUT file modified, need to reload\n");
+        }
+    } else {
+        printf("DEBUG: Could not stat LUT file\n");
+    }
+    
+    if(!lutCamLoaded || needReload){
+        printf("DEBUG: Attempting to load Camera LUT from %s\n", lutPath);
+        FILE* f=fopen(lutPath,"rb");
+        if(f){
+            int W=128,H=128; // TODO if stored in header
+            size_t n=W*H*3;
+            printf("DEBUG: Reading %zu uint16_t values (%dx%dx3) from exposure_lut.bin\n", n, W, H);
+            std::vector<uint16_t> buf(n);
+            size_t read = fread(buf.data(),sizeof(uint16_t),n,f);
+            fclose(f);
+            printf("DEBUG: Read %zu values from file\n", read);
+            if(read == n) {
+                printf("DEBUG: File read successfully, calling UploadExposureLUTCUDA\n");
+                UploadExposureLUTCUDA(buf.data(),W,H);
+                // ACES2065-1 RGB->XYZ
+                const float m[9]={0.9525524f,0.0000000f,0.0000937f,
+                                  0.3439664f,0.7281661f,-0.0721325f,
+                                  0.0000000f,0.0000000f,1.0088252f};
+                UploadCameraMatrixCUDA(m);
+                lutCamLoaded=true;
+                printf("DEBUG: Camera LUT loaded successfully\n");
+            } else {
+                printf("ERROR: Expected %zu values but read %zu\n", n, read);
+            }
+        } else {perror("Camera LUT open"); printf("Camera LUT binary not found, bypassing\n");}
     }
 
     const OfxRectI& bounds = _srcImg->getBounds();
@@ -223,48 +493,46 @@ void AgXEmulsionProcessor::processImagesCUDA()
 
     float* srcPtr = static_cast<float*>(_srcImg->getPixelData());
     float* dstPtr = static_cast<float*>(_dstImg->getPixelData());
-    size_t contigRowBytes = static_cast<size_t>(width) * 4 * sizeof(float);
-    size_t srcRowBytes = _srcImg->getRowBytes();
-    size_t dstRowBytes = _dstImg->getRowBytes();
-
-    // Determine if the src/dst pointers are on device or host
-    cudaPointerAttributes attrSrc{}, attrDst{};
-    bool srcIsDev=false, dstIsDev=false;
-    if(cudaPointerGetAttributes(&attrSrc, srcPtr)==cudaSuccess){ srcIsDev = (attrSrc.type == cudaMemoryTypeDevice); }
-    if(cudaPointerGetAttributes(&attrDst, dstPtr)==cudaSuccess){ dstIsDev = (attrDst.type == cudaMemoryTypeDevice); }
-
-    printf("DEBUG: srcIsDev=%d dstIsDev=%d srcRowBytes=%zu dstRowBytes=%zu contig=%zu\n", srcIsDev, dstIsDev, srcRowBytes, dstRowBytes, contigRowBytes);
-
+    size_t contigBytes = static_cast<size_t>(width) * height * 4 * sizeof(float);
+    // Always use a device staging buffer for correctness
     float* devImg = nullptr;
-    bool inPlaceOK = (srcIsDev && dstIsDev && srcRowBytes==contigRowBytes && dstRowBytes==contigRowBytes);
-    if(inPlaceOK){
-        // Fast path: contiguous buffers on device, copy then process in place
-        cudaError_t err = cudaMemcpy(dstPtr, srcPtr, contigRowBytes*height, cudaMemcpyDeviceToDevice);
-        if(err!=cudaSuccess){ printf("ERROR cudaMemcpy D2D: %s\n", cudaGetErrorString(err)); return; }
-        devImg = dstPtr;
-    } else {
-        // Allocate contiguous staging buffer on device
-        size_t totalBytes = contigRowBytes*height;
-        cudaError_t allocErr = cudaMalloc(&devImg, totalBytes);
-        if(allocErr!=cudaSuccess){ printf("ERROR cudaMalloc devImg: %s\n", cudaGetErrorString(allocErr)); return; }
+    cudaError_t allocErr = cudaMalloc(&devImg, contigBytes);
+    if(allocErr!=cudaSuccess){ printf("ERROR cudaMalloc devImg: %s\n", cudaGetErrorString(allocErr)); return; }
+    cudaError_t cpyInErr = cudaMemcpy(devImg, srcPtr, contigBytes, cudaMemcpyHostToDevice);
+    if(cpyInErr!=cudaSuccess){ printf("ERROR cudaMemcpy H2D: %s\n", cudaGetErrorString(cpyInErr)); cudaFree(devImg); return; }
 
-        // Copy each row taking pitch into account
-        for(int y=0;y<height;y++){
-            const void* srcRowPtr = (const char*)srcPtr + y*srcRowBytes;
-            void* dstRowPtr = (char*)devImg + y*contigRowBytes;
-            cudaMemcpyKind kind;
-            if(srcIsDev) kind = cudaMemcpyDeviceToDevice; else kind = cudaMemcpyHostToDevice;
-            cudaError_t err = cudaMemcpy(dstRowPtr, srcRowPtr, contigRowBytes, kind);
-            if(err!=cudaSuccess){ printf("ERROR row copy to dev y=%d err=%s\n", y, cudaGetErrorString(err)); cudaFree(devImg); return; }
+    if(lutCamLoaded){
+        bool textureValid = IsCameraLUTValid();
+        printf("DEBUG: Camera LUT texture valid = %s\n", textureValid ? "true" : "false");
+        if(textureValid) {
+            LaunchCameraLUTCUDA(devImg,width,height);
+        } else {
+            printf("ERROR: Camera LUT texture not uploaded!\n");
         }
+    } else {
+        printf("Camera LUT texture not uploaded!\n");
     }
 
     if(lutOK){
         // === Negative development with DIR couplers ===
         // Step 1: logE ➜ CMY density
         LaunchEmulsionCUDA(devImg, width, height, _gamma, _exposureEV);
+        // Debug: sample center after Emulsion (logE/gamma)
+        {
+            size_t center = (size_t)(height/2) * width + width/2;
+            float sample[4];
+            cudaMemcpy(sample, devImg + center*4, 3*sizeof(float), cudaMemcpyDeviceToHost);
+            printf("DEBUG: After Emulsion center(logE/gamma) = %f,%f,%f\n", sample[0], sample[1], sample[2]);
+        }
         // Step 2: apply DIR inhibition, converts back to light
         LaunchDirCouplerCUDA(devImg,width,height);
+        // Debug: sample center after DIR (linear RGB)
+        {
+            size_t center = (size_t)(height/2) * width + width/2;
+            float sample[4];
+            cudaMemcpy(sample, devImg + center*4, 3*sizeof(float), cudaMemcpyDeviceToHost);
+            printf("DEBUG: After DIR center(RGB) = %f,%f,%f\n", sample[0], sample[1], sample[2]);
+        }
         // Apply diffusion + halation if enabled
         if(_radius > 0.1f || _halStrength > 1e-5f){
             printf("DEBUG: LaunchDiffusionHalation radius=%f hal=%f\n", _radius, _halStrength);
@@ -276,23 +544,15 @@ void AgXEmulsionProcessor::processImagesCUDA()
             LaunchGrainCUDA(devImg, width, height, _grainStrength, _grainSeed);
         }
 
-        if(_paper[0]!='\0'){
-            printf("DEBUG: LaunchPaperCUDA using %s\n", _paper);
+        if(_paper[0]!='\0' && paperOK){
             LaunchPaperCUDA(devImg,width,height);
         }
     }
 
-    // Copy back if destination is host or if pitch differs
-    if(!inPlaceOK){
-        for(int y=0;y<height;y++){
-            void* dstRowPtr = (char*)dstPtr + y*dstRowBytes;
-            const void* srcRowPtr = (const char*)devImg + y*contigRowBytes;
-            cudaMemcpyKind kind = dstIsDev? cudaMemcpyDeviceToDevice : cudaMemcpyDeviceToHost;
-            cudaError_t err = cudaMemcpy(dstRowPtr, srcRowPtr, contigRowBytes, kind);
-            if(err!=cudaSuccess){ printf("ERROR copy back row y=%d err=%s\n", y, cudaGetErrorString(err)); }
-        }
-        cudaFree(devImg);
-    }
+    // Copy result back to host
+    cudaError_t cpyOutErr = cudaMemcpy(dstPtr, devImg, contigBytes, cudaMemcpyDeviceToHost);
+    if(cpyOutErr!=cudaSuccess){ printf("ERROR cudaMemcpy D2H: %s\n", cudaGetErrorString(cpyOutErr)); }
+    cudaFree(devImg);
 }
 
 void AgXEmulsionProcessor::multiThreadProcessImages(OfxRectI p_ProcWindow)
@@ -361,6 +621,10 @@ private:
     OFX::DoubleParam* m_gammaFactor;
     OFX::DoubleParam* m_exposureEV;
     OFX::ChoiceParam* m_printPaper;
+    OFX::ChoiceParam* m_inputColorSpace;
+    OFX::BooleanParam* m_removeGlare;
+    OFX::DoubleParam* m_printExposure;
+    OFX::DoubleParam* m_preflash;
     OFX::DoubleParam* m_diffusionRadius;
     OFX::DoubleParam* m_halationStrength;
     OFX::DoubleParam* m_grainStrength;
@@ -382,6 +646,10 @@ AgXEmulsionPlugin::AgXEmulsionPlugin(OfxImageEffectHandle p_Handle)
     m_gammaFactor = fetchDoubleParam("gammaFactor");
     m_exposureEV = fetchDoubleParam("exposureEV");
     m_printPaper = fetchChoiceParam("printPaper");
+    m_inputColorSpace = fetchChoiceParam("inputColorSpace");
+    m_removeGlare = fetchBooleanParam("removeGlare");
+    m_printExposure = fetchDoubleParam("printExposure");
+    m_preflash = fetchDoubleParam("preflashExposure");
     m_diffusionRadius = fetchDoubleParam("diffusionRadius");
     m_halationStrength = fetchDoubleParam("halationStrength");
     m_grainStrength   = fetchDoubleParam("grainStrength");
@@ -438,6 +706,19 @@ void AgXEmulsionPlugin::setupAndProcess(AgXEmulsionProcessor& p_AgXProcessor, co
     
     const char* filmName = filmIdx==0?"kodak_portra_400":"kodak_vision3_250d";
     printf("DEBUG: Film name = %s\n", filmName);
+
+    int csIdx;
+    m_inputColorSpace->getValueAtTime(p_Args.time, csIdx);
+    const char* csName = csIdx==0?"ACES2065-1":"Unknown";
+    printf("DEBUG: Input color space = %s\n", csName);
+
+    bool removeGlare;
+    m_removeGlare->getValueAtTime(p_Args.time, removeGlare);
+    printf("DEBUG: removeGlare=%d\n", removeGlare);
+
+    double printExposure = m_printExposure->getValueAtTime(p_Args.time);
+    double preflash = m_preflash->getValueAtTime(p_Args.time);
+    printf("DEBUG: printExposure=%f preflash=%f\n",printExposure,preflash);
     
     double gamma = m_gammaFactor->getValueAtTime(p_Args.time);
     double exposure = m_exposureEV->getValueAtTime(p_Args.time);
@@ -465,6 +746,9 @@ void AgXEmulsionPlugin::setupAndProcess(AgXEmulsionProcessor& p_AgXProcessor, co
     double pxSize    = m_pixelSizeUm->getValueAtTime(p_Args.time);
     printf("DEBUG: DIR params amt=%f inter=%f diffUm=%f highShift=%f pxSize=%f\n",dirAmt,interLay,diffUm,highShift,pxSize);
     p_AgXProcessor.setDirParams((float)dirAmt,(float)interLay,(float)diffUm,(float)highShift,(float)pxSize);
+
+    // after computing removeGlare etc in setupAndProcess before calling processor we call
+     p_AgXProcessor.setPrintParams(removeGlare,(float)printExposure,(float)preflash);
 
     // Setup OpenCL and CUDA Render arguments
     p_AgXProcessor.setGPURenderArgs(p_Args);
@@ -533,6 +817,21 @@ void AgXEmulsionPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_D
 
     // Make some pages and to things in
     PageParamDescriptor* page = p_Desc.definePageParam("Controls");
+
+    // Input color space choice
+    ChoiceParamDescriptor* cschoice = p_Desc.defineChoiceParam("inputColorSpace");
+    cschoice->setLabel("Input Color Space");
+    cschoice->setHint("Linear RGB colour space of source clip");
+    cschoice->appendOption("Linear ACES2065-1 (AP0)");
+    cschoice->setDefault(0);
+    page->addChild(*cschoice);
+
+    // Remove viewing glare toggle
+    BooleanParamDescriptor* glareToggle = p_Desc.defineBooleanParam("removeGlare");
+    glareToggle->setLabel("Remove Viewing Glare");
+    glareToggle->setHint("Apply viewing glare compensation removal to print density curves");
+    glareToggle->setDefault(true);
+    page->addChild(*glareToggle);
 
     // Film stock choice
     ChoiceParamDescriptor* fchoice = p_Desc.defineChoiceParam("filmStock");
@@ -661,6 +960,25 @@ void AgXEmulsionPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_D
     pxParam->setIncrement(0.1);
     pxParam->setDisplayRange(0.1,100.0);
     page->addChild(*pxParam);
+
+    // Print exposure slider
+    DoubleParamDescriptor* pexp = p_Desc.defineDoubleParam("printExposure");
+    pexp->setLabel("Print Exposure");
+    pexp->setHint("Relative exposure multiplier for print projection");
+    pexp->setDefault(1.0);
+    pexp->setRange(0.1,4.0);
+    pexp->setIncrement(0.01);
+    pexp->setDisplayRange(0.1,4.0);
+    page->addChild(*pexp);
+
+    DoubleParamDescriptor* pflash = p_Desc.defineDoubleParam("preflashExposure");
+    pflash->setLabel("Preflash Exposure");
+    pflash->setHint("Additive pre-flash light level (0-0.1)");
+    pflash->setDefault(0.0);
+    pflash->setRange(0.0,0.1);
+    pflash->setIncrement(0.001);
+    pflash->setDisplayRange(0.0,0.1);
+    page->addChild(*pflash);
 }
 
 ImageEffect* AgXEmulsionPluginFactory::createInstance(OfxImageEffectHandle p_Handle, ContextEnum /*p_Context*/)

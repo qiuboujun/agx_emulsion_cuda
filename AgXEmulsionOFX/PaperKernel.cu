@@ -16,6 +16,8 @@ __constant__ float p_specDmin[200];
 __constant__ int  p_specN;
 __constant__ float c_viewSPD[81];
 __constant__ float c_catScale[3];
+__constant__ float p_exposureScale;
+__constant__ float p_preflash;
 
 extern "C" void UploadViewSPDCUDA(const float* spd,int n){
     if(n>81) n=81;
@@ -58,6 +60,10 @@ __global__ void PaperKernel(float* img, int width, int height) {
     float r = img[idx];
     float g = img[idx + 1];
     float b = img[idx + 2];
+    // apply exposure scale and preflash
+    r = r * p_exposureScale + p_preflash;
+    g = g * p_exposureScale + p_preflash;
+    b = b * p_exposureScale + p_preflash;
     
     // Debug first pixel
     if (x == width/2 && y == height/2) {
@@ -213,6 +219,11 @@ extern "C" void UploadPaperSpectraCUDA(const float* c,const float* m,const float
 extern "C" void UploadCATScaleCUDA(const float* scale){
     cudaMemcpyToSymbol(c_catScale,scale,3*sizeof(float));
     printf("UploadCATScaleCUDA DEBUG: scale=(%f,%f,%f)\n",scale[0],scale[1],scale[2]);
+}
+
+extern "C" void UploadPaperParamsCUDA(float exposureScale,float preflash){
+    cudaMemcpyToSymbol(p_exposureScale,&exposureScale,sizeof(float));
+    cudaMemcpyToSymbol(p_preflash,&preflash,sizeof(float));
 }
 
 extern "C" void LaunchPaperCUDA(float* img, int width, int height) {

@@ -9,7 +9,7 @@ ifeq ($(UNAME_SYSTEM), Linux)
 	LDFLAGS = -shared -L${CUDAPATH}/lib64 -lcuda -lcudart -Wl,-rpath,'$$ORIGIN'
 	BUNDLE_DIR = AgXEmulsionPlugin.ofx.bundle/Contents/Linux-x86-64/
 	CUDA_OBJ = EmulsionKernel.o DiffusionHalationKernel.o GrainKernel.o PaperKernel.o \
-             DirCouplerKernel.o
+             DirCouplerKernel.o CameraLUTKernel.o
 	CXXFLAGS_PLUGIN = -I.. -I../ref/grain_ofx/OpenFX-1.4/include -I../ref/grain_ofx/Support/include -Wall -Wextra -std=gnu++11 -fPIC -I${CUDAPATH}/include
 endif
 
@@ -42,6 +42,9 @@ PaperKernel.o: PaperKernel.cu
 DirCouplerKernel.o: DirCouplerKernel.cu
 	${NVCC} -c $< $(NVCCFLAGS)
 
+CameraLUTKernel.o: CameraLUTKernel.cu CameraLUTKernel.cuh
+	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+
 AgXEmulsionPlugin.o: AgXEmulsionPlugin.cpp
 	$(CXX) -c $< $(CXXFLAGS_PLUGIN)
 
@@ -57,7 +60,11 @@ clean:
 	rm -fr AgXEmulsionPlugin.ofx.bundle
 
 install: AgXEmulsionPlugin.ofx
-	cp -fr AgXEmulsionPlugin.ofx.bundle /usr/OFX/Plugins 
+	# Copy exposure LUT into the bundle
+	mkdir -p $(BUNDLE_DIR)data
+	cp data/exposure_lut.bin $(BUNDLE_DIR)data/
+	# Install OFX plugin bundle
+	cp -fr AgXEmulsionPlugin.ofx.bundle /usr/OFX/Plugins
 
 # ---------- unit tests -----------
 .PHONY: tests
@@ -100,3 +107,16 @@ tests/test_emulsion: tests/prep_emulsion ../tests/test_emulsion.cpp ../emulsion.
 tests/test_emulsion_coupler: ../tests/test_emulsion_coupler.cpp ../emulsion.cpp ../interpolate.cpp ../couplers.cpp
 	mkdir -p tests
 	$(CXX) -I.. -std=gnu++11 ../tests/test_emulsion_coupler.cpp ../emulsion.cpp ../interpolate.cpp ../couplers.cpp -o $@ 
+
+# Test program
+test_camera_lut: test_camera_lut.o CameraLUTKernel.o EmulsionKernel.o DirCouplerKernel.o DiffusionHalationKernel.o GrainKernel.o PaperKernel.o
+	g++ -o test_camera_lut test_camera_lut.o CameraLUTKernel.o EmulsionKernel.o DirCouplerKernel.o DiffusionHalationKernel.o GrainKernel.o PaperKernel.o -L/usr/local/cuda/lib64 -lcuda -lcudart
+
+test_camera_lut.o: test_camera_lut.cpp
+	g++ -c test_camera_lut.cpp -I.. -I../ref/grain_ofx/OpenFX-1.4/include -I../ref/grain_ofx/Support/include -Wall -Wextra -std=gnu++11 -fPIC -I/usr/local/cuda/include
+
+test_emulsion: test_emulsion.o EmulsionKernel.o CameraLUTKernel.o DirCouplerKernel.o DiffusionHalationKernel.o GrainKernel.o PaperKernel.o
+	g++ -o test_emulsion test_emulsion.o EmulsionKernel.o CameraLUTKernel.o DirCouplerKernel.o DiffusionHalationKernel.o GrainKernel.o PaperKernel.o -L/usr/local/cuda/lib64 -lcuda -lcudart -ldl
+
+test_emulsion.o: test_emulsion.cpp
+	g++ -c test_emulsion.cpp -I.. -I../ref/grain_ofx/OpenFX-1.4/include -I../ref/grain_ofx/Support/include -Wall -Wextra -std=gnu++11 -fPIC -I/usr/local/cuda/include 

@@ -11,13 +11,12 @@ __constant__ float c_exposureEV;
 __device__ __forceinline__ float lerp(float a,float b,float t){return a+(b-a)*t;}
 
 __device__ float lookupDensity(const float* curve,const float* logE,float val){
-    if(val<=logE[0]){
-        float t=(val-logE[0])/(logE[1]-logE[0]);
-        return lerp(curve[0],curve[1],t); // extrapolate below
+    // clamp to table range
+    if(val <= logE[0]) {
+        return curve[0];
     }
-    if(val>=logE[600]){
-        float t=(val-logE[599])/(logE[600]-logE[599]);
-        return lerp(curve[599],curve[600],t); // extrapolate above
+    if(val >= logE[600]) {
+        return curve[600];
     }
     // linear search (601 small)
     int idx=0;
@@ -36,10 +35,10 @@ __global__ void EmulsionKernel(float* img, int width, int height)
     float logER = log10f(fmaxf(p.x,1e-6f)) + c_exposureEV*0.30103f;
     float logEG = log10f(fmaxf(p.y,1e-6f)) + c_exposureEV*0.30103f;
     float logEB = log10f(fmaxf(p.z,1e-6f)) + c_exposureEV*0.30103f;
-    // Store log-exposure (raw) for DIR coupler stage
-    p.x = logER;
-    p.y = logEG;
-    p.z = logEB;
+    // Convert log-exposure to CMY density
+    p.x = lookupDensity(c_curveR, c_logE, logER / c_gamma);
+    p.y = lookupDensity(c_curveG, c_logE, logEG / c_gamma);
+    p.z = lookupDensity(c_curveB, c_logE, logEB / c_gamma);
     pix[idx]=p;
 }
 

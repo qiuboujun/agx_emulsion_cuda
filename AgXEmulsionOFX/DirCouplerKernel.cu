@@ -66,27 +66,24 @@ extern __constant__ float c_logE[601];
 extern __constant__ float c_curveR[601];
 extern __constant__ float c_curveG[601];
 extern __constant__ float c_curveB[601];
-extern __constant__ float c_gamma;
 __device__ float lookupDensityCUDA(const float* curve,const float* logE,float val);
 
 __global__ void BuildCorrectionKernel(const float* image,float* corr,int W,int H){
     int idx = blockIdx.x*blockDim.x + threadIdx.x;
     int total = W*H;
     if(idx>=total) return;
-    int base = idx*4; // float4 layout RGBA
+    int base = idx*4; // RGBA stride
     float3 d;
-    float logR = image[base+0];
-    float logG = image[base+1];
-    float logB = image[base+2];
-    float densR = lookupDensityCUDA(c_curveR, c_logE, logR / c_gamma);
-    float densG = lookupDensityCUDA(c_curveG, c_logE, logG / c_gamma);
-    float densB = lookupDensityCUDA(c_curveB, c_logE, logB / c_gamma);
+    // Image holds CMY density
+    float densR = image[base+0];
+    float densG = image[base+1];
+    float densB = image[base+2];
     d.x = densR / c_dMax[0];
     d.y = densG / c_dMax[1];
     d.z = densB / c_dMax[2];
-    d.x+=c_highShift*d.x*d.x;
-    d.y+=c_highShift*d.y*d.y;
-    d.z+=c_highShift*d.z*d.z;
+    d.x += c_highShift * d.x * d.x;
+    d.y += c_highShift * d.y * d.y;
+    d.z += c_highShift * d.z * d.z;
     float3 out;
     out.x=d.x*c_dirM[0]+d.y*c_dirM[1]+d.z*c_dirM[2];
     out.y=d.x*c_dirM[3]+d.y*c_dirM[4]+d.z*c_dirM[5];
@@ -116,19 +113,13 @@ __global__ void ApplyCorrectionKernel(float* img,const float* corr,int W,int H){
     int idx=blockIdx.x*blockDim.x+threadIdx.x;
     if(idx>=W*H) return;
     int base = idx*4;
-    float3 corrv = {corr[idx*3+0], corr[idx*3+1], corr[idx*3+2]};
-    float3 p;
-    p.x = img[base+0] - corrv.x;
-    p.y = img[base+1] - corrv.y;
-    p.z = img[base+2] - corrv.z;
-    // re-interpolate density curves (gamma assumed 1 in negative stage)
-    float dR=lookupDensityCUDA(c_curveR,c_logE,p.x);
-    float dG=lookupDensityCUDA(c_curveG,c_logE,p.y);
-    float dB=lookupDensityCUDA(c_curveB,c_logE,p.z);
-    // convert to light transmission overwrite logE buffer with light (will feed print stage)
-    img[base+0] = powf(10.0f, -dR);
-    img[base+1] = powf(10.0f, -dG);
-    img[base+2] = powf(10.0f, -dB);
+    // Subtract correction from density and convert to light
+    float densR = img[base+0] - corr[idx*3+0];
+    float densG = img[base+1] - corr[idx*3+1];
+    float densB = img[base+2] - corr[idx*3+2];
+    img[base+0] = powf(10.0f, -densR);
+    img[base+1] = powf(10.0f, -densG);
+    img[base+2] = powf(10.0f, -densB);
 }
 
 extern "C" void UploadDirMatrixCUDA(const float* M){cudaMemcpyToSymbol(c_dirM,M,9*sizeof(float));}
