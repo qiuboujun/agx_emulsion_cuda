@@ -1,5 +1,6 @@
 #include "EmulsionKernel.cuh"
 #include <cuda_runtime.h>
+#include <stdio.h>
 
 __constant__ float c_logE[601];
 __constant__ float c_curveR[601];
@@ -32,13 +33,46 @@ __global__ void EmulsionKernel(float* img, int width, int height)
     if(idx>=total) return;
     float4* pix = reinterpret_cast<float4*>(img);
     float4 p = pix[idx];
-    float logER = log10f(fmaxf(p.x,1e-6f)) + c_exposureEV*0.30103f;
-    float logEG = log10f(fmaxf(p.y,1e-6f)) + c_exposureEV*0.30103f;
-    float logEB = log10f(fmaxf(p.z,1e-6f)) + c_exposureEV*0.30103f;
-    // Convert log-exposure to CMY density
-    p.x = lookupDensity(c_curveR, c_logE, logER / c_gamma);
-    p.y = lookupDensity(c_curveG, c_logE, logEG / c_gamma);
-    p.z = lookupDensity(c_curveB, c_logE, logEB / c_gamma);
+    
+    // Debug center pixel only
+    bool isCenter = (idx == (height/2) * width + width/2);
+    
+    // Input p.x, p.y, p.z are CMY light values from Camera LUT stage
+    // We need to convert them to log exposure values first
+    // CMY light values are in the range [0, ~10] typically
+    // Log exposure should be in the range [-3, 4] typically
+    
+    // Convert CMY light values to log exposure
+    // The relationship is: log_exposure = log10(CMY_light)
+    float logER = log10f(fmaxf(p.x,1e-6f));
+    float logEG = log10f(fmaxf(p.y,1e-6f));
+    float logEB = log10f(fmaxf(p.z,1e-6f));
+    
+    // Apply exposure adjustment
+    logER += c_exposureEV*0.30103f;
+    logEG += c_exposureEV*0.30103f;
+    logEB += c_exposureEV*0.30103f;
+    
+    if(isCenter) {
+        printf("Emulsion DEBUG: Input CMY=(%f,%f,%f)\n", p.x, p.y, p.z);
+        printf("Emulsion DEBUG: Log exposure=(%f,%f,%f)\n", logER, logEG, logEB);
+        printf("Emulsion DEBUG: After gamma=(%f,%f,%f)\n", logER/c_gamma, logEG/c_gamma, logEB/c_gamma);
+        printf("Emulsion DEBUG: Film curve range=[%f,%f]\n", c_logE[0], c_logE[600]);
+    }
+    
+    // Convert log-exposure to CMY density using film curves
+    float densityR = lookupDensity(c_curveR, c_logE, logER / c_gamma);
+    float densityG = lookupDensity(c_curveG, c_logE, logEG / c_gamma);
+    float densityB = lookupDensity(c_curveB, c_logE, logEB / c_gamma);
+    
+    if(isCenter) {
+        printf("Emulsion DEBUG: Lookup results=(%f,%f,%f)\n", densityR, densityG, densityB);
+    }
+    
+    p.x = densityR;
+    p.y = densityG;
+    p.z = densityB;
+    
     pix[idx]=p;
 }
 

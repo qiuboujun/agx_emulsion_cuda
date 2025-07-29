@@ -1,0 +1,5 @@
+original_shape_x=192
+original_shape_y=192
+spectral_samples=81
+total_coordinates=36864
+data_type=float32

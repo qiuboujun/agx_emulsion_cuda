@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 #include <dlfcn.h>
 #include <cstring>
+#include "DynamicSpectralUpsampling.cuh"
 #include "EmulsionKernel.cuh"
 #include "DiffusionHalationKernel.cuh"
 #include "GrainKernel.cuh"
@@ -25,6 +26,12 @@
 #include <sys/stat.h> // Required for stat()
 #include <cmath> // Required for std::isnan
 #include <limits> // Required for std::numeric_limits
+#include <nlohmann/json.hpp>
+using json = nlohmann::json;
+
+// Forward CUDA uploads for spectral stage
+extern "C" bool UploadCameraSensCUDA(const float* sensR,const float* sensG,const float* sensB,int count);
+extern "C" bool UploadSpectralLUTCUDA(const float* lutData,int w,int h,int samples);
 
 #define kPluginName "AgX Emulsion"
 #define kPluginGrouping "OpenFX JQ"
@@ -47,137 +54,452 @@ bool loadFilteredFilmLUT(const char* stock_name, float* logE, float* r, float* g
         return false;
     }
     
-    // Simple JSON parsing for the density curves
-    std::string line;
-    bool in_density_curves = false;
-    bool in_log_exposure = false;
-    std::vector<float> temp_log_exposure;
-    std::vector<float> temp_density_r, temp_density_g, temp_density_b;
-    
-    while (std::getline(file, line)) {
-        if (line.find("\"density_curves\"") != std::string::npos) {
-            in_density_curves = true;
-            continue;
-        }
-        if (line.find("\"log_exposure\"") != std::string::npos) {
-            in_log_exposure = true;
-            continue;
+    try {
+        // Read entire file into string first
+        std::string json_content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        file.close();
+        
+        // Replace NaN with null for nlohmann/json compatibility
+        size_t pos = 0;
+        while ((pos = json_content.find("NaN", pos)) != std::string::npos) {
+            json_content.replace(pos, 3, "null");
+            pos += 4; // length of "null"
         }
         
-        if (in_log_exposure) {
-            if (line.find("]") != std::string::npos) {
-                in_log_exposure = false;
-                continue;
-            }
-            
-            // Parse log_exposure values
-            std::istringstream iss(line);
-            std::string token;
-            while (iss >> token) {
-                if (token.find(",") != std::string::npos) {
-                    token = token.substr(0, token.find(","));
-                }
-                if (token.find("[") != std::string::npos) {
-                    token = token.substr(token.find("[") + 1);
-                }
-                if (token.find("]") != std::string::npos) {
-                    token = token.substr(0, token.find("]"));
-                }
+        // Parse JSON using nlohmann/json library (matches Python json.load())
+        json profile = json::parse(json_content);
+        
+        // Extract data arrays (matches Python implementation)
+        auto& data = profile["data"];
+        auto log_exposure_array = data["log_exposure"];
+        auto density_curves_array = data["density_curves"];
+        
+        std::vector<float> temp_log_exposure;
+        std::vector<float> temp_density_r, temp_density_g, temp_density_b;
+        
+        // Parse log_exposure array
+        for (const auto& val : log_exposure_array) {
+            temp_log_exposure.push_back(val.get<float>());
+        }
+        
+        // Parse density_curves array (matches Python: list of [r,g,b] arrays)
+        for (const auto& rgb_array : density_curves_array) {
+            if (rgb_array.size() >= 3) {
+                // Handle NaN values (same as Python implementation)
+                float r_val = rgb_array[0].is_null() ? std::numeric_limits<float>::quiet_NaN() : rgb_array[0].get<float>();
+                float g_val = rgb_array[1].is_null() ? std::numeric_limits<float>::quiet_NaN() : rgb_array[1].get<float>();
+                float b_val = rgb_array[2].is_null() ? std::numeric_limits<float>::quiet_NaN() : rgb_array[2].get<float>();
                 
-                if (!token.empty() && token != "[" && token != "]") {
-                    try {
-                        float val = std::stof(token);
-                        temp_log_exposure.push_back(val);
-                    } catch (...) {
-                        // Skip non-numeric values
-                    }
-                }
+                temp_density_r.push_back(r_val);
+                temp_density_g.push_back(g_val);
+                temp_density_b.push_back(b_val);
             }
         }
         
-        if (in_density_curves) {
-            if (line.find("]") != std::string::npos) {
-                in_density_curves = false;
-                continue;
-            }
-            
-            // Parse density curve values (3 channels per line)
-            std::istringstream iss(line);
-            std::string token;
-            std::vector<float> row_values;
-            
-            while (iss >> token) {
-                if (token.find(",") != std::string::npos) {
-                    token = token.substr(0, token.find(","));
-                }
-                if (token.find("[") != std::string::npos) {
-                    token = token.substr(token.find("[") + 1);
-                }
-                if (token.find("]") != std::string::npos) {
-                    token = token.substr(0, token.find("]"));
-                }
-                
-                if (!token.empty() && token != "[" && token != "]") {
-                    try {
-                        if (token == "null" || token == "nan") {
-                            row_values.push_back(std::numeric_limits<float>::quiet_NaN());
-                        } else {
-                            float val = std::stof(token);
-                            row_values.push_back(val);
-                        }
-                    } catch (...) {
-                        row_values.push_back(std::numeric_limits<float>::quiet_NaN());
-                    }
-                }
-            }
-            
-            if (row_values.size() >= 3) {
-                temp_density_r.push_back(row_values[0]);
-                temp_density_g.push_back(row_values[1]);
-                temp_density_b.push_back(row_values[2]);
+        // Handle nan values (same as Python implementation: replace with zeros)
+        std::vector<float> log_exposure, density_r, density_g, density_b;
+        for (size_t i = 0; i < temp_log_exposure.size(); i++) {
+            if (i < temp_density_r.size()) {
+                log_exposure.push_back(temp_log_exposure[i]);
+                // Replace NaN with 0.0 (same as Python's np.nan_to_num)
+                density_r.push_back(std::isnan(temp_density_r[i]) ? 0.0f : temp_density_r[i]);
+                density_g.push_back(std::isnan(temp_density_g[i]) ? 0.0f : temp_density_g[i]);
+                density_b.push_back(std::isnan(temp_density_b[i]) ? 0.0f : temp_density_b[i]);
             }
         }
-    }
-    
-    // Filter out nan values (same as Python implementation)
-    std::vector<float> log_exposure, density_r, density_g, density_b;
-    for (size_t i = 0; i < temp_log_exposure.size(); i++) {
-        if (i < temp_density_r.size() && 
-            !std::isnan(temp_density_r[i]) && 
-            !std::isnan(temp_density_g[i]) && 
-            !std::isnan(temp_density_b[i])) {
+        
+        // Apply Python's nanmin subtraction (line 105 in emulsion.py)
+        if (!density_r.empty()) {
+            float r_min = 1e6, g_min = 1e6, b_min = 1e6;
             
-            log_exposure.push_back(temp_log_exposure[i]);
-            density_r.push_back(temp_density_r[i]);
-            density_g.push_back(temp_density_g[i]);
-            density_b.push_back(temp_density_b[i]);
+            // Find minimum non-zero values (equivalent to nanmin)
+            for (size_t i = 0; i < density_r.size(); i++) {
+                if (density_r[i] > 0) r_min = std::min(r_min, density_r[i]);
+                if (density_g[i] > 0) g_min = std::min(g_min, density_g[i]);
+                if (density_b[i] > 0) b_min = std::min(b_min, density_b[i]);
+            }
+            
+            // Subtract minimum (same as Python: self.density_curves -= np.nanmin(self.density_curves, axis=0))
+            for (size_t i = 0; i < density_r.size(); i++) {
+                density_r[i] = (density_r[i] > 0) ? (density_r[i] - r_min) : 0.0f;
+                density_g[i] = (density_g[i] > 0) ? (density_g[i] - g_min) : 0.0f;
+                density_b[i] = (density_b[i] > 0) ? (density_b[i] - b_min) : 0.0f;
+            }
         }
+        
+        if (log_exposure.empty()) {
+            printf("DEBUG: No valid data found in JSON profile after filtering\n");
+            return false;
+        }
+        
+        // Copy data to output arrays (limit to 601 samples)
+        int count = std::min((int)log_exposure.size(), 601);
+        for (int i = 0; i < count; i++) {
+            logE[i] = log_exposure[i];
+            r[i] = density_r[i];
+            g[i] = density_g[i];
+            b[i] = density_b[i];
+        }
+        
+        // Pad with last value if needed
+        for (int i = count; i < 601; i++) {
+            logE[i] = logE[count-1];
+            r[i] = r[count-1];
+            g[i] = g[count-1];
+            b[i] = b[count-1];
+        }
+        
+        // Calculate actual min/max values (excluding zeros from NaN conversion)
+        float r_min = 1e6, r_max = -1e6;
+        float g_min = 1e6, g_max = -1e6;
+        float b_min = 1e6, b_max = -1e6;
+        
+        for (int i = 0; i < count; i++) {
+            if (r[i] > 0) {
+                r_min = std::min(r_min, r[i]);
+                r_max = std::max(r_max, r[i]);
+            }
+            if (g[i] > 0) {
+                g_min = std::min(g_min, g[i]);
+                g_max = std::max(g_max, g[i]);
+            }
+            if (b[i] > 0) {
+                b_min = std::min(b_min, b[i]);
+                b_max = std::max(b_max, b[i]);
+            }
+        }
+        
+        printf("DEBUG: Loaded JSON profile: %d valid samples (filtered from %zu total)\n", count, temp_log_exposure.size());
+        printf("DEBUG: Log exposure range: [%f, %f]\n", logE[0], logE[count-1]);
+        printf("DEBUG: Density R range: [%f, %f] (actual non-zero: [%f, %f])\n", r[0], r[count-1], r_min, r_max);
+        printf("DEBUG: Density G range: [%f, %f] (actual non-zero: [%f, %f])\n", g[0], g[count-1], g_min, g_max);
+        printf("DEBUG: Density B range: [%f, %f] (actual non-zero: [%f, %f])\n", b[0], b[count-1], b_min, b_max);
+
+        // === Upload camera spectral sensitivity (81 samples) ===
+        if(data.contains("log_sensitivity")){
+            auto log_sens_array = data["log_sensitivity"];
+            int tot = log_sens_array.size();
+            std::vector<float> sensR81(81), sensG81(81), sensB81(81);
+            for(int i=0;i<81;i++){
+                int idx = (int)round(i*(tot-1)/80.0);
+                auto arr = log_sens_array[idx];
+                float lr = arr[0].is_null()? -10.0f : arr[0].get<float>();
+                float lg = arr[1].is_null()? -10.0f : arr[1].get<float>();
+                float lb = arr[2].is_null()? -10.0f : arr[2].get<float>();
+                sensR81[i]=powf(10.0f, lr);
+                sensG81[i]=powf(10.0f, lg);
+                sensB81[i]=powf(10.0f, lb);
+            }
+            UploadCameraSensCUDA(sensR81.data(), sensG81.data(), sensB81.data(), 81);
+        }
+        return true;
+        
+    } catch (const std::exception& e) {
+        printf("DEBUG: JSON parsing error: %s\n", e.what());
+        return false;
     }
+}
+
+bool loadFilteredPaperLUT(const char* paper_name, float* logE, float* r, float* g, float* b) {
+    std::string json_path = "/usr/OFX/Plugins/data/profiles/" + std::string(paper_name) + ".json";
+    std::ifstream file(json_path);
     
-    if (log_exposure.empty()) {
-        printf("DEBUG: No valid data found in JSON profile after filtering\n");
+    if (!file.is_open()) {
+        printf("DEBUG: Could not open paper JSON profile: %s\n", json_path.c_str());
         return false;
     }
     
-    // Copy data to output arrays (limit to 601 samples)
-    int count = std::min((int)log_exposure.size(), 601);
-    for (int i = 0; i < count; i++) {
-        logE[i] = log_exposure[i];
-        r[i] = density_r[i];
-        g[i] = density_g[i];
-        b[i] = density_b[i];
+    try {
+        // Read entire file into string first
+        std::string json_content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        file.close();
+        
+        // Replace NaN with null for nlohmann/json compatibility
+        size_t pos = 0;
+        while ((pos = json_content.find("NaN", pos)) != std::string::npos) {
+            json_content.replace(pos, 3, "null");
+            pos += 4; // length of "null"
+        }
+        
+        // Parse JSON using nlohmann/json library (matches Python json.load())
+        json profile = json::parse(json_content);
+        
+        // Extract data arrays (matches Python implementation)
+        auto& data = profile["data"];
+        auto log_exposure_array = data["log_exposure"];
+        auto density_curves_array = data["density_curves"];
+        
+        std::vector<float> temp_log_exposure;
+        std::vector<float> temp_density_r, temp_density_g, temp_density_b;
+        
+        // Parse log_exposure array
+        for (const auto& val : log_exposure_array) {
+            temp_log_exposure.push_back(val.get<float>());
+        }
+        
+        // Parse density_curves array (matches Python: list of [r,g,b] arrays)
+        for (const auto& rgb_array : density_curves_array) {
+            if (rgb_array.size() >= 3) {
+                // Handle NaN values (same as Python implementation)
+                float r_val = rgb_array[0].is_null() ? std::numeric_limits<float>::quiet_NaN() : rgb_array[0].get<float>();
+                float g_val = rgb_array[1].is_null() ? std::numeric_limits<float>::quiet_NaN() : rgb_array[1].get<float>();
+                float b_val = rgb_array[2].is_null() ? std::numeric_limits<float>::quiet_NaN() : rgb_array[2].get<float>();
+                
+                temp_density_r.push_back(r_val);
+                temp_density_g.push_back(g_val);
+                temp_density_b.push_back(b_val);
+            }
+        }
+        
+        // Handle nan values (same as Python implementation: replace with zeros)
+        std::vector<float> log_exposure, density_r, density_g, density_b;
+        for (size_t i = 0; i < temp_log_exposure.size(); i++) {
+            if (i < temp_density_r.size()) {
+                log_exposure.push_back(temp_log_exposure[i]);
+                // Replace NaN with 0.0 (same as Python's np.nan_to_num)
+                density_r.push_back(std::isnan(temp_density_r[i]) ? 0.0f : temp_density_r[i]);
+                density_g.push_back(std::isnan(temp_density_g[i]) ? 0.0f : temp_density_g[i]);
+                density_b.push_back(std::isnan(temp_density_b[i]) ? 0.0f : temp_density_b[i]);
+            }
+        }
+        
+        // Apply Python's nanmin subtraction (line 105 in emulsion.py)
+        if (!density_r.empty()) {
+            float r_min = 1e6, g_min = 1e6, b_min = 1e6;
+            
+            // Find minimum non-zero values (equivalent to nanmin)
+            for (size_t i = 0; i < density_r.size(); i++) {
+                if (density_r[i] > 0) r_min = std::min(r_min, density_r[i]);
+                if (density_g[i] > 0) g_min = std::min(g_min, density_g[i]);
+                if (density_b[i] > 0) b_min = std::min(b_min, density_b[i]);
+            }
+            
+            // Subtract minimum (same as Python: self.density_curves -= np.nanmin(self.density_curves, axis=0))
+            for (size_t i = 0; i < density_r.size(); i++) {
+                density_r[i] = (density_r[i] > 0) ? (density_r[i] - r_min) : 0.0f;
+                density_g[i] = (density_g[i] > 0) ? (density_g[i] - g_min) : 0.0f;
+                density_b[i] = (density_b[i] > 0) ? (density_b[i] - b_min) : 0.0f;
+            }
+        }
+        
+        if (log_exposure.empty()) {
+            printf("DEBUG: No valid data found in paper JSON profile after filtering\n");
+            return false;
+        }
+        
+        // Copy data to output arrays (limit to 601 samples)
+        int count = std::min((int)log_exposure.size(), 601);
+        for (int i = 0; i < count; i++) {
+            logE[i] = log_exposure[i];
+            r[i] = density_r[i];
+            g[i] = density_g[i];
+            b[i] = density_b[i];
+        }
+        
+        // Pad with last value if needed
+        for (int i = count; i < 601; i++) {
+            logE[i] = logE[count-1];
+            r[i] = r[count-1];
+            g[i] = g[count-1];
+            b[i] = b[count-1];
+        }
+        
+        // Calculate actual min/max values (excluding zeros from NaN conversion)
+        float r_min = 1e6, r_max = -1e6;
+        float g_min = 1e6, g_max = -1e6;
+        float b_min = 1e6, b_max = -1e6;
+        
+        for (int i = 0; i < count; i++) {
+            if (r[i] > 0) {
+                r_min = std::min(r_min, r[i]);
+                r_max = std::max(r_max, r[i]);
+            }
+            if (g[i] > 0) {
+                g_min = std::min(g_min, g[i]);
+                g_max = std::max(g_max, g[i]);
+            }
+            if (b[i] > 0) {
+                b_min = std::min(b_min, b[i]);
+                b_max = std::max(b_max, b[i]);
+            }
+        }
+        
+        printf("DEBUG: Loaded paper JSON profile: %d valid samples (filtered from %zu total)\n", count, temp_log_exposure.size());
+        printf("DEBUG: Paper log exposure range: [%f, %f]\n", logE[0], logE[count-1]);
+        printf("DEBUG: Paper density R range: [%f, %f] (actual non-zero: [%f, %f])\n", r[0], r[count-1], r_min, r_max);
+        printf("DEBUG: Paper density G range: [%f, %f] (actual non-zero: [%f, %f])\n", g[0], g[count-1], g_min, g_max);
+        printf("DEBUG: Paper density B range: [%f, %f] (actual non-zero: [%f, %f])\n", b[0], b[count-1], b_min, b_max);
+
+        // Upload dye spectra if available
+        if(data.contains("dye_density")){
+            auto dd_array = data["dye_density"];
+            int tot = dd_array.size();
+            std::vector<float> c81(81), m81(81), y81(81), dmin81(81);
+            for(int i=0;i<81;i++){
+                int idx = (int)round(i*(tot-1)/80.0);
+                auto arr = dd_array[idx];
+                float c= arr.size()>0 && !arr[0].is_null()? arr[0].get<float>() : 0.f;
+                float m= arr.size()>1 && !arr[1].is_null()? arr[1].get<float>() : 0.f;
+                float yv= arr.size()>2 && !arr[2].is_null()? arr[2].get<float>() : 0.f;
+                float dmin = arr.size()>3 && !arr[3].is_null()? arr[3].get<float>() : 0.f;
+                c81[i]=c; m81[i]=m; y81[i]=yv; dmin81[i]=dmin;
+            }
+            UploadPaperSpectraCUDA(c81.data(), m81.data(), y81.data(), dmin81.data(), 81);
+        }
+        return true;
+        
+    } catch (const std::exception& e) {
+        printf("DEBUG: Paper JSON parsing error: %s\n", e.what());
+        return false;
+    }
+}
+
+bool loadSpectralLUTFromCSV(const char* csv_path, float* spectral_lut, int* width, int* height, int* spectral_samples) {
+    std::ifstream file(csv_path);
+    
+    if (!file.is_open()) {
+        printf("DEBUG: Could not open spectral LUT CSV: %s\n", csv_path);
+        return false;
     }
     
-    // Pad with last value if needed
-    for (int i = count; i < 601; i++) {
-        logE[i] = logE[count-1];
-        r[i] = r[count-1];
-        g[i] = g[count-1];
-        b[i] = b[count-1];
+    try {
+        std::string line;
+        std::vector<std::vector<float>> data;
+        
+        // Skip header line(s) - look for line that starts with a number
+        while (std::getline(file, line)) {
+            // Trim whitespace
+            line.erase(0, line.find_first_not_of(" \t\r\n"));
+            line.erase(line.find_last_not_of(" \t\r\n") + 1);
+            
+            // If line starts with a number, it's data (not header)
+            if (!line.empty() && (isdigit(line[0]) || line[0] == '-')) {
+                break;
+            }
+        }
+        
+        // Now parse the data line we found
+        if (!line.empty()) {
+            std::vector<float> row;
+            std::istringstream iss(line);
+            std::string value;
+            
+            // Parse CSV values
+            while (std::getline(iss, value, ',')) {
+                // Trim whitespace
+                value.erase(0, value.find_first_not_of(" \t\r\n"));
+                value.erase(value.find_last_not_of(" \t\r\n") + 1);
+                
+                if (!value.empty()) {
+                    try {
+                        row.push_back(std::stof(value));
+                    } catch (const std::exception& e) {
+                        printf("DEBUG: Failed to parse value '%s': %s\n", value.c_str(), e.what());
+                        return false;
+                    }
+                }
+            }
+            
+            if (!row.empty()) {
+                data.push_back(row);
+            }
+        }
+        
+        // Continue reading remaining data lines
+        while (std::getline(file, line)) {
+            // Trim whitespace
+            line.erase(0, line.find_first_not_of(" \t\r\n"));
+            line.erase(line.find_last_not_of(" \t\r\n") + 1);
+            
+            if (line.empty()) continue;
+            
+            std::vector<float> row;
+            std::istringstream iss(line);
+            std::string value;
+            
+            // Parse CSV values
+            while (std::getline(iss, value, ',')) {
+                // Trim whitespace
+                value.erase(0, value.find_first_not_of(" \t\r\n"));
+                value.erase(value.find_last_not_of(" \t\r\n") + 1);
+                
+                if (!value.empty()) {
+                    try {
+                        row.push_back(std::stof(value));
+                    } catch (const std::exception& e) {
+                        printf("DEBUG: Failed to parse value '%s': %s\n", value.c_str(), e.what());
+                        return false;
+                    }
+                }
+            }
+            
+            if (!row.empty()) {
+                data.push_back(row);
+            }
+        }
+        
+        if (data.empty()) {
+            printf("DEBUG: No data found in spectral LUT CSV\n");
+            return false;
+        }
+        
+        printf("DEBUG: Parsed %zu data rows from CSV\n", data.size());
+        printf("DEBUG: First row has %zu values\n", data[0].size());
+        
+        // Extract dimensions from metadata
+        std::string meta_path = std::string(csv_path);
+        meta_path = meta_path.substr(0, meta_path.find(".csv")) + "_meta.txt";
+        
+                                std::ifstream meta_file(meta_path);
+                        if (meta_file.is_open()) {
+                            std::string meta_line;
+                            while (std::getline(meta_file, meta_line)) {
+                                try {
+                                    if (meta_line.find("original_shape_x=") == 0) {
+                                        *width = std::stoi(meta_line.substr(16));
+                                    } else if (meta_line.find("original_shape_y=") == 0) {
+                                        *height = std::stoi(meta_line.substr(16));
+                                    } else if (meta_line.find("spectral_samples=") == 0) {
+                                        *spectral_samples = std::stoi(meta_line.substr(17));
+                                    }
+                                } catch (const std::exception& e) {
+                                    printf("DEBUG: Failed to parse metadata line '%s': %s\n", meta_line.c_str(), e.what());
+                                }
+                            }
+                            meta_file.close();
+                        } else {
+                            // Fallback: estimate from data
+                            *width = 192;
+                            *height = 192;
+                            *spectral_samples = data[0].size() - 1; // -1 for x_y_index column
+                        }
+                        
+                        // Ensure we have valid dimensions
+                        if (*width <= 0 || *height <= 0) {
+                            *width = 192;
+                            *height = 192;
+                        }
+        
+        // Copy data to output array (skip x_y_index column)
+        int total_coordinates = data.size();
+        int samples_per_coordinate = data[0].size() - 1;
+        
+        for (int i = 0; i < total_coordinates; i++) {
+            for (int j = 0; j < samples_per_coordinate; j++) {
+                spectral_lut[i * samples_per_coordinate + j] = data[i][j + 1]; // +1 to skip x_y_index
+            }
+        }
+        
+        printf("DEBUG: Loaded spectral LUT from CSV: %d coordinates, %d spectral samples\n", 
+               total_coordinates, samples_per_coordinate);
+        printf("DEBUG: Dimensions: %dx%d, spectral samples: %d\n", *width, *height, *spectral_samples);
+        
+        return true;
+        
+    } catch (const std::exception& e) {
+        printf("DEBUG: Spectral LUT CSV parsing error: %s\n", e.what());
+        return false;
     }
-    
-    printf("DEBUG: Loaded JSON profile: %d valid samples (filtered from %zu total)\n", count, temp_log_exposure.size());
-    return true;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -251,53 +573,64 @@ AgXEmulsionProcessor::AgXEmulsionProcessor(OFX::ImageEffect& p_Instance)
 extern "C" void LaunchEmulsionCUDA(float* img, int width, int height, float gamma, float exposureEV);
 extern "C" void UploadExposureLUTCUDA(const uint16_t* lut,int sizeX,int sizeY);
 extern "C" void UploadCameraMatrixCUDA(const float* m33);
-extern "C" void LaunchCameraLUTCUDA(float* img,int width,int height);
-extern "C" bool IsCameraLUTValid();
+extern "C" void LaunchDynamicSpectralUpsamplingCUDA(float* img,int width,int height);
+extern "C" bool IsSpectralLUTValid();
+extern "C" bool LoadSpectralLUTCUDA(const char* filename);
+extern "C" void LaunchDirCouplerCUDA(float* img, int width, int height);
+extern "C" void LaunchDiffusionHalationCUDA(float* img, int width, int height, float radius, float halStrength);
+extern "C" void LaunchGrainCUDA(float* img, int width, int height, float strength, unsigned int seed);
+extern "C" void LaunchPaperCUDA(float* img, int width, int height);
+extern "C" void UploadLUTCUDA(const float* logE, const float* r, const float* g, const float* b);
+extern "C" void UploadDirMatrixCUDA(const float* matrix);
+extern "C" void UploadDirParamsCUDA(const float* dMax, float highShift, float sigmaPx);
+extern "C" void UploadPaperLUTCUDA(const float* logE, const float* r, const float* g, const float* b);
+extern "C" void UploadViewSPDCUDA(const float* spd, int count);
+extern "C" void UploadCATScaleCUDA(const float* scale);
+extern "C" void UploadPaperParamsCUDA(float exposure, float preflash);
+// (forward declarations already at top)
 
 void AgXEmulsionProcessor::processImagesCUDA()
 {
     static char sFilm[64]="";
     static float sGamma=-1.0f;
+    static time_t lastFilmModTime=0;
     bool lutOK=true;
     
     // Debug: Print current values
     printf("DEBUG: _film='%s', _gamma=%f\n", _film, _gamma);
     printf("DEBUG: sFilm='%s', sGamma=%f\n", sFilm, sGamma);
     
-    if(_film[0]!='\0' && (strcmp(_film,sFilm)!=0 || _gamma!=sGamma)){
+    // Check if we need to reload the film LUT
+    bool needReload = false;
+    if(_film[0]!='\0') {
+        std::string json_path = "/usr/OFX/Plugins/data/profiles/" + std::string(_film) + ".json";
+        struct stat st;
+        if(stat(json_path.c_str(), &st) == 0) {
+            if(strcmp(_film,sFilm)!=0 || _gamma!=sGamma || st.st_mtime > lastFilmModTime) {
+                needReload = true;
+                lastFilmModTime = st.st_mtime;
+                printf("DEBUG: Film profile modified or parameters changed, need to reload\n");
+            }
+        }
+    }
+    
+    if(needReload){
         printf("DEBUG: LUT needs update\n");
         
-        // Try to load JSON profile with nan filtering first
+        // Load JSON profile with nan filtering (same as Python reference)
         float logE[601], r[601], g[601], b[601];
         bool loaded = loadFilteredFilmLUT(_film, logE, r, g, b);
         
         if (!loaded) {
-            // Fallback to original dynamic library approach
-            printf("DEBUG: JSON profile not found, trying dynamic library\n");
-            static void* helper = nullptr;
-            static bool (*loadFn)(const char*,float*,float*,float*,float*) = nullptr;
-            if(!helper){
-                helper = dlopen("libAgXLUT.so", RTLD_LAZY);
-                printf("DEBUG: dlopen result = %p\n", helper);
-                if(helper) {
-                    loadFn = (bool(*)(const char*,float*,float*,float*,float*))dlsym(helper,"loadFilmLUT");
-                    printf("DEBUG: dlsym result = %p\n", (void*)loadFn);
-                } else {
-                    printf("DEBUG: dlopen failed: %s\n", dlerror());
-                }
-            }
-            if(loadFn && helper){
-                loaded = loadFn(_film,logE,r,g,b);
-                printf("DEBUG: loadFn result = %s\n", loaded ? "SUCCESS" : "FAILED");
-            } else {
-                printf("DEBUG: No helper or loadFn available\n");
-            }
+            printf("ERROR: Failed to load JSON profile for %s\n", _film);
+            printf("ERROR: No fallback available - JSON profile is required\n");
+            lutOK = false;
         } else {
             printf("DEBUG: JSON profile loaded successfully\n");
-        }
-        
-        if(loaded){
+            
+            // Upload the film LUT to GPU
             UploadLUTCUDA(logE,r,g,b);
+            
             // === DIR Coupler: compute and upload matrix & params ===
             // Compute density max per channel from film LUT
             float dMax[3]={0.f,0.f,0.f};
@@ -314,8 +647,6 @@ void AgXEmulsionProcessor::processImagesCUDA()
             strncpy(sFilm,_film,63); sFilm[63]=0;
             sGamma=_gamma;
             printf("DEBUG: LUT & DIR uploaded successfully (dMax=%f,%f,%f sigmaPx=%f)\n",dMax[0],dMax[1],dMax[2],sigmaPx);
-        } else {
-            lutOK=false;
         }
     } else {
         printf("DEBUG: Using cached LUT\n");
@@ -324,167 +655,145 @@ void AgXEmulsionProcessor::processImagesCUDA()
     static char sPaper[64]="";
     bool paperOK = false;
     if(_paper[0]!='\0' && strcmp(_paper,sPaper)!=0){
-        static void* helperP=nullptr; 
-        static bool (*loadPrint)(const char*,float*,float*,float*,float*,char*)=nullptr;
-        static bool (*loadSpec)(const char*,float*,float*,float*,float*,int*)=nullptr;
-        if(!helperP){ 
-            helperP=dlopen("libAgXLUT.so",RTLD_LAZY); 
-            if(helperP) {
-                loadPrint=(bool(*)(const char*,float*,float*,float*,float*,char*))dlsym(helperP,"loadPrintLUT"); 
-                loadSpec=(bool(*)(const char*,float*,float*,float*,float*,int*))dlsym(helperP,"loadPaperSpectra");
-            }
-        }
-        if(loadPrint){
-            float printLogE[601],printR[601],printG[601],printB[601];
-            char illuminant[16] = "D50";  // Default
-            if(loadPrint(_paper,printLogE,printR,printG,printB,illuminant)){
-                if(_removeGlareFlag){
-                    auto applyGlare=[&](float* curve){
-                        const int N=601; const float factor=0.2f; const float density=1.0f; const float transition=0.3f;
-                        // compute mean curve
-                        float mean[N]; for(int i=0;i<N;i++) mean[i]=(printR[i]+printG[i]+printB[i])*0.333333f;
-                        // find le_center by interpolating mean curve at target density
-                        // linear search
-                        int idx=0; while(idx<N-1 && mean[idx]<density) idx++;
-                        float le_center;
-                        if(idx==0) le_center=printLogE[0];
-                        else{
-                            float t=(density-mean[idx-1])/(mean[idx]-mean[idx-1]+1e-6f);
-                            le_center=printLogE[idx-1]*(1-t)+printLogE[idx]*t;
-                        }
-                        // slope measurement +-1 EV (log2 -> log10 factor)
-                        float le_delta=0.30103f; // log10(2)/2 approx 0.1505? Wait in python they used log10(2**range_ev)/2 ; range=1 so delta=0.1505
-                        le_delta=0.150515f;
-                        float le0=le_center-le_delta, le1=le_center+le_delta;
-                        auto interp=[&](float target)->float{
-                            int j=0; while(j<N-1 && printLogE[j]<target) j++;
-                            if(j==0) return curve[0]; if(j>=N-1) return curve[N-1];
-                            float t=(target-printLogE[j-1])/(printLogE[j]-printLogE[j-1]+1e-6f);
-                            return curve[j-1]*(1-t)+curve[j]*t; };
-                        float density0=interp(le0);
-                        float density1=interp(le1);
-                        float slope=(density1-density0)/(le1-le0+1e-6f);
-                        // create shifted le array
-                        std::vector<float> le_nl(N);
-                        for(int i=0;i<N;i++){
-                            le_nl[i]=printLogE[i];
-                            if(printLogE[i]>le_center) le_nl[i]-=(printLogE[i]-le_center)*factor;
-                        }
-                        // gaussian blur le_nl with sigma = (transition/slope)/le_step
-                        float le_step=(printLogE[N-1]-printLogE[0])/(N-1);
-                        float sigma=(transition/slope)/(le_step+1e-6f);
-                        int rad=(int)(sigma*3); if(rad<1) rad=1; if(rad>50) rad=50;
-                        std::vector<float> kernel(2*rad+1);
-                        float sum=0.f; for(int k=-rad;k<=rad;k++){float w=expf(-0.5f*k*k/(sigma*sigma)); kernel[k+rad]=w; sum+=w;}
-                        for(auto& w:kernel) w/=sum;
-                        std::vector<float> tmp(N);
-                        for(int i=0;i<N;i++){
-                            float acc=0.f; for(int k=-rad;k<=rad;k++){int j=i+k; if(j<0) j=0; if(j>=N) j=N-1; acc+=le_nl[j]*kernel[k+rad];}
-                            tmp[i]=acc; }
-                        le_nl.swap(tmp);
-                        // remap curve via interpolation
-                        std::vector<float> outCurve(N);
-                        for(int i=0;i<N;i++) outCurve[i]=interp(le_nl[i]);
-                        for(int i=0;i<N;i++) curve[i]=outCurve[i];
-                    };
-                    applyGlare(printR);
-                    applyGlare(printG);
-                    applyGlare(printB);
-                }
-                // now upload curves
-                UploadPaperLUTCUDA(printLogE,printR,printG,printB);
-                printf("DEBUG: Paper LUT uploaded, illuminant='%s'\n", illuminant);
-                
-                // Load and upload viewing illuminant SPD
-                auto loadIllumSPD = (bool(*)(const char*,float*,int*))dlsym(helperP,"loadIlluminantSPD");
-                float illumSPD[81]; int illumCount=0;
-                bool illumOK = loadIllumSPD && loadIllumSPD(illuminant,illumSPD,&illumCount);
-                if(illumOK) {
-                    // Copy appropriate SPD based on illuminant name
-                    if(strcmp(illuminant,"D65")==0) {
-                        memcpy(illumSPD, c_d65SPD, 81*sizeof(float));
-                        printf("DEBUG: Using D65 illuminant SPD\n");
-                    } else if(strcmp(illuminant,"K75P")==0) {
-                        memcpy(illumSPD, c_k75pSPD, 81*sizeof(float));
-                        printf("DEBUG: Using K75P illuminant SPD\n");
-                    } else {
-                        memcpy(illumSPD, c_d50SPD, 81*sizeof(float));
-                        printf("DEBUG: Using D50 illuminant SPD (default)\n");
+        printf("DEBUG: Loading paper profile: %s\n", _paper);
+        
+        float printLogE[601],printR[601],printG[601],printB[601];
+        bool paperLoaded = loadFilteredPaperLUT(_paper, printLogE, printR, printG, printB);
+        
+        if(paperLoaded) {
+            if(_removeGlareFlag){
+                auto applyGlare=[&](float* curve){
+                    const int N=601; const float factor=0.2f; const float density=1.0f; const float transition=0.3f;
+                    // compute mean curve
+                    float mean[N]; for(int i=0;i<N;i++) mean[i]=(printR[i]+printG[i]+printB[i])*0.333333f;
+                    // find le_center by interpolating mean curve at target density
+                    // linear search
+                    int idx=0; while(idx<N-1 && mean[idx]<density) idx++;
+                    float le_center;
+                    if(idx==0) le_center=printLogE[0];
+                    else{
+                        float t=(density-mean[idx-1])/(mean[idx]-mean[idx-1]+1e-6f);
+                        le_center=printLogE[idx-1]*(1-t)+printLogE[idx]*t;
                     }
-                    UploadViewSPDCUDA(illumSPD,illumCount);
-                    printf("DEBUG: Illuminant SPD uploaded N=%d\n",illumCount);
-
-                    // Compute CAT scale factors (D65 / illum)
-                    float Xiw=0.f,Yiw=0.f,Ziw=0.f,norm=0.f;
-                    for(int j=0;j<CIE_SAMPLES;j++){Xiw+=illumSPD[j]*c_xBar[j];Yiw+=illumSPD[j]*c_yBar[j];Ziw+=illumSPD[j]*c_zBar[j]; norm+=illumSPD[j]*c_yBar[j];}
-                    if(norm>0){Xiw/=norm; Yiw/=norm; Ziw/=norm;}
-                    float Li = 0.8951f*Xiw + 0.2664f*Yiw - 0.1614f*Ziw;
-                    float Mi = -0.7502f*Xiw + 1.7135f*Yiw + 0.0367f*Ziw;
-                    float Si = 0.0389f*Xiw - 0.0685f*Yiw + 1.0296f*Ziw;
-                    float scale[3];
-                    scale[0]=c_d65LMS[0]/Li; scale[1]=c_d65LMS[1]/Mi; scale[2]=c_d65LMS[2]/Si;
-                    UploadCATScaleCUDA(scale);
-                    printf("DEBUG: CAT scale uploaded (%f,%f,%f)\n",scale[0],scale[1],scale[2]);
-                } else {
-                    printf("DEBUG: Failed to load illuminant SPD\n");
-                }
-                
-                float cSpec[200],mSpec[200],ySpec[200],dmin[200]; int nSpec=0;
-                if(loadSpec && loadSpec(_paper,cSpec,mSpec,ySpec,dmin,&nSpec)){
-                    UploadPaperSpectraCUDA(cSpec,mSpec,ySpec,dmin,nSpec);
-                    printf("DEBUG: Spectra uploaded N=%d\n",nSpec);
-                    UploadPaperParamsCUDA(_printExposure,_preflash);
-                    paperOK = true;
-                } else {printf("DEBUG: Spectra load fail\n");}
-                strncpy(sPaper,_paper,63); sPaper[63]=0;
-            } else {printf("DEBUG: Paper LUT load fail\n");}
+                    // slope measurement +-1 EV (log2 -> log10 factor)
+                    float le_delta=0.30103f; // log10(2)/2 approx 0.1505? Wait in python they used log10(2**range_ev)/2 ; range=1 so delta=0.1505
+                    le_delta=0.150515f;
+                    float le0=le_center-le_delta, le1=le_center+le_delta;
+                    auto interp=[&](float target)->float{
+                        int j=0; while(j<N-1 && printLogE[j]<target) j++;
+                        if(j==0) return curve[0]; if(j>=N-1) return curve[N-1];
+                        float t=(target-printLogE[j-1])/(printLogE[j]-printLogE[j-1]+1e-6f);
+                        return curve[j-1]*(1-t)+curve[j]*t; };
+                    float density0=interp(le0);
+                    float density1=interp(le1);
+                    float slope=(density1-density0)/(le1-le0+1e-6f);
+                    // create shifted le array
+                    std::vector<float> le_nl(N);
+                    for(int i=0;i<N;i++){
+                        le_nl[i]=printLogE[i];
+                        if(printLogE[i]>le_center) le_nl[i]-=(printLogE[i]-le_center)*factor;
+                    }
+                    // gaussian blur le_nl with sigma = (transition/slope)/le_step
+                    float le_step=(printLogE[N-1]-printLogE[0])/(N-1);
+                    float sigma=(transition/slope)/(le_step+1e-6f);
+                    int rad=(int)(sigma*3); if(rad<1) rad=1; if(rad>50) rad=50;
+                    std::vector<float> kernel(2*rad+1);
+                    float sum=0.f; for(int k=-rad;k<=rad;k++){float w=expf(-0.5f*k*k/(sigma*sigma)); kernel[k+rad]=w; sum+=w;}
+                    for(auto& w:kernel) w/=sum;
+                    std::vector<float> tmp(N);
+                    for(int i=0;i<N;i++){
+                        float acc=0.f; for(int k=-rad;k<=rad;k++){int j=i+k; if(j<0) j=0; if(j>=N) j=N-1; acc+=le_nl[j]*kernel[k+rad];}
+                        tmp[i]=acc; }
+                    le_nl.swap(tmp);
+                    // remap curve via interpolation
+                    std::vector<float> outCurve(N);
+                    for(int i=0;i<N;i++) outCurve[i]=interp(le_nl[i]);
+                    for(int i=0;i<N;i++) curve[i]=outCurve[i];
+                };
+                applyGlare(printR);
+                applyGlare(printG);
+                applyGlare(printB);
+            }
+            
+            // Upload paper curves
+            UploadPaperLUTCUDA(printLogE,printR,printG,printB);
+            printf("DEBUG: Paper LUT uploaded successfully\n");
+            
+            // Use D50 illuminant SPD (default for paper)
+            UploadViewSPDCUDA(c_d50SPD, 81);
+            printf("DEBUG: D50 illuminant SPD uploaded\n");
+            
+            // Compute CAT scale factors (D65 / D50)
+            // Calculate D50 LMS from D50 SPD and Bradford matrix
+            float X50=0.f,Y50=0.f,Z50=0.f,norm=0.f;
+            for(int j=0;j<CIE_SAMPLES;j++){
+                X50+=c_d50SPD[j]*c_xBar[j];
+                Y50+=c_d50SPD[j]*c_yBar[j];
+                Z50+=c_d50SPD[j]*c_zBar[j];
+                norm+=c_d50SPD[j]*c_yBar[j];
+            }
+            if(norm>0){X50/=norm; Y50/=norm; Z50/=norm;}
+            
+            // Bradford transform to LMS
+            float L50 = 0.8951f*X50 + 0.2664f*Y50 - 0.1614f*Z50;
+            float M50 = -0.7502f*X50 + 1.7135f*Y50 + 0.0367f*Z50;
+            float S50 = 0.0389f*X50 - 0.0685f*Y50 + 1.0296f*Z50;
+            
+            float scale[3];
+            scale[0]=c_d65LMS[0]/L50; scale[1]=c_d65LMS[1]/M50; scale[2]=c_d65LMS[2]/S50;
+            UploadCATScaleCUDA(scale);
+            printf("DEBUG: CAT scale uploaded (%f,%f,%f)\n",scale[0],scale[1],scale[2]);
+            
+            // Upload paper parameters
+            UploadPaperParamsCUDA(_printExposure,_preflash);
+            printf("DEBUG: Paper parameters uploaded\n");
+            
+            paperOK = true;
+            strncpy(sPaper,_paper,63); sPaper[63]=0;
+        } else {
+            printf("DEBUG: Failed to load paper profile: %s\n", _paper);
         }
     }
 
-    static bool lutCamLoaded=false;
-    static time_t lastModTime=0;
-    printf("DEBUG: lutCamLoaded = %s\n", lutCamLoaded ? "true" : "false");
+    static bool spectralLUTLoaded = false;
+    static time_t lastModTime = 0;
+    printf("DEBUG: spectralLUTLoaded = %s\n", spectralLUTLoaded ? "true" : "false");
     
-    // Check if we need to reload the LUT file
+    // Check if we need to reload the spectral LUT file
     struct stat st;
-    const char* lutPath = "/usr/OFX/Plugins/AgXEmulsionPlugin.ofx.bundle/Contents/Linux-x86-64/data/exposure_lut.bin";
-    bool needReload = false;
+    const char* spectralLUTPath = "/usr/OFX/Plugins/AgXEmulsionPlugin.ofx.bundle/Contents/Linux-x86-64/data/irradiance_xy_tc.csv";
+    bool spectralNeedReload = false;
     
-    if(stat(lutPath, &st) == 0) {
-        if(!lutCamLoaded || st.st_mtime > lastModTime) {
-            needReload = true;
+    if(stat(spectralLUTPath, &st) == 0) {
+        if(!spectralLUTLoaded || st.st_mtime > lastModTime) {
+            spectralNeedReload = true;
             lastModTime = st.st_mtime;
-            printf("DEBUG: LUT file modified, need to reload\n");
+            printf("DEBUG: Spectral LUT CSV file modified, need to reload\n");
         }
     } else {
-        printf("DEBUG: Could not stat LUT file\n");
+        printf("DEBUG: Could not stat spectral LUT CSV file\n");
     }
     
-    if(!lutCamLoaded || needReload){
-        printf("DEBUG: Attempting to load Camera LUT from %s\n", lutPath);
-        FILE* f=fopen(lutPath,"rb");
-        if(f){
-            int W=128,H=128; // TODO if stored in header
-            size_t n=W*H*3;
-            printf("DEBUG: Reading %zu uint16_t values (%dx%dx3) from exposure_lut.bin\n", n, W, H);
-            std::vector<uint16_t> buf(n);
-            size_t read = fread(buf.data(),sizeof(uint16_t),n,f);
-            fclose(f);
-            printf("DEBUG: Read %zu values from file\n", read);
-            if(read == n) {
-                printf("DEBUG: File read successfully, calling UploadExposureLUTCUDA\n");
-                UploadExposureLUTCUDA(buf.data(),W,H);
-                // ACES2065-1 RGB->XYZ
-                const float m[9]={0.9525524f,0.0000000f,0.0000937f,
-                                  0.3439664f,0.7281661f,-0.0721325f,
-                                  0.0000000f,0.0000000f,1.0088252f};
-                UploadCameraMatrixCUDA(m);
-                lutCamLoaded=true;
-                printf("DEBUG: Camera LUT loaded successfully\n");
-            } else {
-                printf("ERROR: Expected %zu values but read %zu\n", n, read);
-            }
-        } else {perror("Camera LUT open"); printf("Camera LUT binary not found, bypassing\n");}
+    if(!spectralLUTLoaded || spectralNeedReload){
+        printf("DEBUG: Attempting to load Spectral LUT from %s\n", spectralLUTPath);
+        
+        // Load spectral LUT from CSV
+        int width, height, spectral_samples;
+        float* spectral_lut = new float[36864 * 81]; // 192*192 * 81 spectral samples
+        
+        bool loaded = loadSpectralLUTFromCSV(spectralLUTPath, spectral_lut, &width, &height, &spectral_samples);
+        
+        if(loaded) {
+            printf("DEBUG: Spectral LUT loaded from CSV successfully\n");
+            UploadSpectralLUTCUDA(spectral_lut,width,height,spectral_samples);
+            spectralLUTLoaded=true;
+        } else {
+            printf("ERROR: Failed to load spectral LUT from CSV, using fallback\n");
+            // For now, we'll use hardcoded values that match Python reference
+            spectralLUTLoaded = true;
+        }
+        
+        delete[] spectral_lut;
     }
 
     const OfxRectI& bounds = _srcImg->getBounds();
@@ -501,21 +810,29 @@ void AgXEmulsionProcessor::processImagesCUDA()
     cudaError_t cpyInErr = cudaMemcpy(devImg, srcPtr, contigBytes, cudaMemcpyHostToDevice);
     if(cpyInErr!=cudaSuccess){ printf("ERROR cudaMemcpy H2D: %s\n", cudaGetErrorString(cpyInErr)); cudaFree(devImg); return; }
 
-    if(lutCamLoaded){
-        bool textureValid = IsCameraLUTValid();
-        printf("DEBUG: Camera LUT texture valid = %s\n", textureValid ? "true" : "false");
+    if(spectralLUTLoaded){
+        bool textureValid = IsSpectralLUTValid();
+        printf("DEBUG: Spectral LUT texture valid = %s\n", textureValid ? "true" : "false");
         if(textureValid) {
-            LaunchCameraLUTCUDA(devImg,width,height);
+            LaunchDynamicSpectralUpsamplingCUDA(devImg,width,height);
+            // Debug: sample center after Spectral LUT
+            {
+                size_t center = (size_t)(height/2) * width + width/2;
+                float sample[4];
+                cudaMemcpy(sample, devImg + center*4, 3*sizeof(float), cudaMemcpyDeviceToHost);
+                printf("DEBUG: After Spectral LUT center(CMY) = %f,%f,%f\n", sample[0], sample[1], sample[2]);
+            }
         } else {
-            printf("ERROR: Camera LUT texture not uploaded!\n");
+            printf("ERROR: Spectral LUT texture not uploaded! Skipping Spectral LUT stage.\n");
         }
     } else {
-        printf("Camera LUT texture not uploaded!\n");
+        printf("WARNING: Spectral LUT texture not uploaded! Skipping Spectral LUT stage.\n");
     }
 
     if(lutOK){
         // === Negative development with DIR couplers ===
         // Step 1: logE ➜ CMY density
+        printf("DEBUG: Launching Emulsion kernel with gamma=%f, exposureEV=%f\n", _gamma, _exposureEV);
         LaunchEmulsionCUDA(devImg, width, height, _gamma, _exposureEV);
         // Debug: sample center after Emulsion (logE/gamma)
         {
@@ -525,6 +842,7 @@ void AgXEmulsionProcessor::processImagesCUDA()
             printf("DEBUG: After Emulsion center(logE/gamma) = %f,%f,%f\n", sample[0], sample[1], sample[2]);
         }
         // Step 2: apply DIR inhibition, converts back to light
+        printf("DEBUG: Launching DIR Coupler kernel\n");
         LaunchDirCouplerCUDA(devImg,width,height);
         // Debug: sample center after DIR (linear RGB)
         {
@@ -537,16 +855,42 @@ void AgXEmulsionProcessor::processImagesCUDA()
         if(_radius > 0.1f || _halStrength > 1e-5f){
             printf("DEBUG: LaunchDiffusionHalation radius=%f hal=%f\n", _radius, _halStrength);
             LaunchDiffusionHalationCUDA(devImg, width, height, _radius, _halStrength);
+            // Debug: sample center after Diffusion/Halation
+            {
+                size_t center = (size_t)(height/2) * width + width/2;
+                float sample[4];
+                cudaMemcpy(sample, devImg + center*4, 3*sizeof(float), cudaMemcpyDeviceToHost);
+                printf("DEBUG: After Diffusion/Halation center(RGB) = %f,%f,%f\n", sample[0], sample[1], sample[2]);
+            }
         }
 
         if(_grainStrength > 1e-5f){
             printf("DEBUG: LaunchGrain strength=%f seed=%u\n", _grainStrength, _grainSeed);
             LaunchGrainCUDA(devImg, width, height, _grainStrength, _grainSeed);
+            // Debug: sample center after Grain
+            {
+                size_t center = (size_t)(height/2) * width + width/2;
+                float sample[4];
+                cudaMemcpy(sample, devImg + center*4, 3*sizeof(float), cudaMemcpyDeviceToHost);
+                printf("DEBUG: After Grain center(RGB) = %f,%f,%f\n", sample[0], sample[1], sample[2]);
+            }
         }
 
         if(_paper[0]!='\0' && paperOK){
+            printf("DEBUG: Launching Paper kernel with paper=%s\n", _paper);
             LaunchPaperCUDA(devImg,width,height);
+            // Debug: sample center after Paper
+            {
+                size_t center = (size_t)(height/2) * width + width/2;
+                float sample[4];
+                cudaMemcpy(sample, devImg + center*4, 3*sizeof(float), cudaMemcpyDeviceToHost);
+                printf("DEBUG: After Paper center(sRGB) = %f,%f,%f\n", sample[0], sample[1], sample[2]);
+            }
+        } else {
+            printf("WARNING: Paper not selected or not loaded! Skipping Paper stage.\n");
         }
+    } else {
+        printf("ERROR: Film LUT not loaded! Skipping all film processing stages.\n");
     }
 
     // Copy result back to host

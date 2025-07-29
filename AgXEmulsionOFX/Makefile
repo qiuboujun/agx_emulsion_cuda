@@ -9,20 +9,17 @@ ifeq ($(UNAME_SYSTEM), Linux)
 	LDFLAGS = -shared -L${CUDAPATH}/lib64 -lcuda -lcudart -Wl,-rpath,'$$ORIGIN'
 	BUNDLE_DIR = AgXEmulsionPlugin.ofx.bundle/Contents/Linux-x86-64/
 	CUDA_OBJ = EmulsionKernel.o DiffusionHalationKernel.o GrainKernel.o PaperKernel.o \
-             DirCouplerKernel.o CameraLUTKernel.o
+             DirCouplerKernel.o DynamicSpectralUpsampling.o
+	OBJ = AgXEmulsionPlugin.o ${CUDA_OBJ} couplers.o ofxsCore.o ofxsImageEffect.o ofxsInteract.o ofxsLog.o ofxsMultiThread.o ofxsParams.o ofxsProperty.o ofxsPropertyValidation.o
 	CXXFLAGS_PLUGIN = -I.. -I../ref/grain_ofx/OpenFX-1.4/include -I../ref/grain_ofx/Support/include -Wall -Wextra -std=gnu++11 -fPIC -I${CUDAPATH}/include
 endif
 
-all: AgXEmulsionPlugin.ofx libAgXLUT.so
+all: AgXEmulsionPlugin.ofx
 
-libAgXLUT.so: ../LUTHelper.cpp
-	$(CXX) -shared -std=gnu++11 -fPIC $< -o $@ -Wl,-rpath,'$$ORIGIN'
-
-AgXEmulsionPlugin.ofx: AgXEmulsionPlugin.o ${CUDA_OBJ} couplers.o ofxsCore.o ofxsImageEffect.o ofxsInteract.o ofxsLog.o ofxsMultiThread.o ofxsParams.o ofxsProperty.o ofxsPropertyValidation.o libAgXLUT.so
-	$(CXX) $(filter-out libAgXLUT.so,$^) -o $@ $(LDFLAGS)
+AgXEmulsionPlugin.ofx: $(OBJ)
+	$(CXX) $^ -o $@ $(LDFLAGS)
 	mkdir -p $(BUNDLE_DIR)
 	cp AgXEmulsionPlugin.ofx $(BUNDLE_DIR)
-	cp libAgXLUT.so $(BUNDLE_DIR)
 
 couplers.o: ../couplers.cpp ../couplers.hpp
 	$(CXX) -c $< -o $@ $(CXXFLAGS)
@@ -42,7 +39,7 @@ PaperKernel.o: PaperKernel.cu
 DirCouplerKernel.o: DirCouplerKernel.cu
 	${NVCC} -c $< $(NVCCFLAGS)
 
-CameraLUTKernel.o: CameraLUTKernel.cu CameraLUTKernel.cuh
+DynamicSpectralUpsampling.o: DynamicSpectralUpsampling.cu DynamicSpectralUpsampling.cuh
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
 AgXEmulsionPlugin.o: AgXEmulsionPlugin.cpp
@@ -60,9 +57,10 @@ clean:
 	rm -fr AgXEmulsionPlugin.ofx.bundle
 
 install: AgXEmulsionPlugin.ofx
-	# Copy exposure LUT into the bundle
+	# Copy spectral LUT into the bundle
 	mkdir -p $(BUNDLE_DIR)data
-	cp data/exposure_lut.bin $(BUNDLE_DIR)data/
+	cp data/irradiance_xy_tc.csv $(BUNDLE_DIR)data/
+	cp data/irradiance_xy_tc_meta.txt $(BUNDLE_DIR)data/
 	# Install OFX plugin bundle
 	cp -fr AgXEmulsionPlugin.ofx.bundle /usr/OFX/Plugins
 
