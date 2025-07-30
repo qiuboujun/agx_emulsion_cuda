@@ -534,27 +534,14 @@ bool loadAndPreMultiplySpectralLUT(const char* csv_path, const std::vector<float
     printf("DEBUG: Sensitivity R[40]=%.6f, G[40]=%.6f, B[40]=%.6f\n", sensR[40], sensG[40], sensB[40]);
     printf("DEBUG: Sensitivity R[80]=%.6f, G[80]=%.6f, B[80]=%.6f\n", sensR[80], sensG[80], sensB[80]);
     
-    // Normalize sensitivity curves to peak=1 (like Python does)
-    float max_sens_r = 0.0f, max_sens_g = 0.0f, max_sens_b = 0.0f;
-    for (int s = 0; s < 81; s++) {
-        max_sens_r = std::max(max_sens_r, sensR[s]);
-        max_sens_g = std::max(max_sens_g, sensG[s]);
-        max_sens_b = std::max(max_sens_b, sensB[s]);
-    }
+    // Use raw sensitivity curves (do NOT normalize - Python doesn't normalize either)
+    float maxSensR = *std::max_element(&sensR[0], &sensR[81]);
+    float maxSensG = *std::max_element(&sensG[0], &sensG[81]); 
+    float maxSensB = *std::max_element(&sensB[0], &sensB[81]);
+    printf("DEBUG: Using raw sensitivity curves (max values: R=%.1f, G=%.1f, B=%.1f)\n", 
+           maxSensR, maxSensG, maxSensB);
     
-    printf("DEBUG: Max sensitivity values: R=%.6f, G=%.6f, B=%.6f\n", max_sens_r, max_sens_g, max_sens_b);
-    
-    // Normalize to peak=1
-    std::vector<float> norm_sensR(81), norm_sensG(81), norm_sensB(81);
-    for (int s = 0; s < 81; s++) {
-        norm_sensR[s] = (max_sens_r > 0.0f) ? sensR[s] / max_sens_r : 0.0f;
-        norm_sensG[s] = (max_sens_g > 0.0f) ? sensG[s] / max_sens_g : 0.0f;
-        norm_sensB[s] = (max_sens_b > 0.0f) ? sensB[s] / max_sens_b : 0.0f;
-    }
-    
-    printf("DEBUG: Normalized sensitivity R[40]=%.6f, G[40]=%.6f, B[40]=%.6f\n", norm_sensR[40], norm_sensG[40], norm_sensB[40]);
-    
-    // Pre-multiply with normalized sensitivity curves (Python: tc_lut = contract('ijl,lm->ijm', HANATOS2025_SPECTRA_LUT, sensitivity))
+    // Pre-multiply with raw sensitivity curves (Python: tc_lut = contract('ijl,lm->ijm', HANATOS2025_SPECTRA_LUT, sensitivity))
     // Raw layout: [coordinate][spectral_sample]
     // Output layout: [coordinate][RGB_channel]
     int total_coordinates = (*width) * (*height);
@@ -565,9 +552,9 @@ bool loadAndPreMultiplySpectralLUT(const char* csv_path, const std::vector<float
         
         for (int s = 0; s < spectral_samples && s < 81; s++) {
             float spectrum_val = raw_spectral_lut[coord * spectral_samples + s];
-            raw_r += spectrum_val * norm_sensR[s];
-            raw_g += spectrum_val * norm_sensG[s];
-            raw_b += spectrum_val * norm_sensB[s];
+            raw_r += spectrum_val * sensR[s];
+            raw_g += spectrum_val * sensG[s];
+            raw_b += spectrum_val * sensB[s];
         }
         
         // Store pre-multiplied values: [coordinate][RGB_channel]

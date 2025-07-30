@@ -89,7 +89,7 @@ __device__ void rgb_to_tc_b(float3 rgb, float2* tc, float* b) {
     xy.x = fmaxf(0.0f, fminf(1.0f, xy.x));
     xy.y = fmaxf(0.0f, fminf(1.0f, xy.y));
     
-    // Convert to triangular coordinates
+    // Convert xy chromaticity directly to texture coordinates
     *tc = tri2quad(xy);
     
     // Handle NaN values
@@ -272,7 +272,7 @@ __global__ void DynamicSpectralUpsamplingKernel(float* img, int width, int heigh
         printf("SpectralKernel DEBUG: xy=(%f,%f)\n", xy.x, xy.y);
     }
     
-    // Convert xy to tc using tri2quad transform
+    // Convert xy chromaticity directly to texture coordinates (as Python does)
     float2 tc = tri2quad(xy);
     
     if (is_first_thread) {
@@ -318,7 +318,7 @@ __global__ void DynamicSpectralUpsamplingKernel(float* img, int width, int heigh
     float3 midgray_xyz = rgb_to_xyz(midgray_rgb);
     float midgray_brightness = midgray_xyz.x + midgray_xyz.y + midgray_xyz.z;
     float2 midgray_xy = make_float2(midgray_xyz.x/midgray_brightness, midgray_xyz.y/midgray_brightness);
-    float2 midgray_tc = tri2quad(midgray_xy);
+            float2 midgray_tc = tri2quad(midgray_xy);
     
     // Fetch midgray raw RGB values using cubic interpolation (matches Python)
     float midgray_raw[3];
